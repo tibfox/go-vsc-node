@@ -40,7 +40,7 @@ const TSS_SIGN_INTERVAL = 20 //* 2
 // 5 minutes in blocks
 const TSS_ROTATE_INTERVAL = 20 * 5
 
-const TSS_ACTIVATE_HEIGHT = 100_897_115
+const TSS_ACTIVATE_HEIGHT = 100_997_304
 
 // 24 hour blame
 var BLAME_EXPIRE = uint64(24 * 60 * 20)
@@ -330,6 +330,10 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 			// 	}
 			// }
 
+			fmt.Println("commitment", commitment)
+			if commitment.KeyId == "vsc1BcS12fD42kKqL2SMLeBzaEKtd9QbBWC1dt-main" {
+				commitment.Epoch = uint64(809)
+			}
 			commitmentElection := tssMgr.electionDb.GetElection(commitment.Epoch)
 
 			commitmentBytes, err := base64.RawURLEncoding.DecodeString(commitment.Commitment)
@@ -397,10 +401,16 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 		}
 	}
 
+	startedDispatcher := make([]Dispatcher, 0)
 	for _, dispatcher := range dispatchers {
 		fmt.Println("dispatcher started!")
+		//If start fails then done is never possible
+		//todo: handle this better
 		err := dispatcher.Start()
 
+		if err == nil {
+			startedDispatcher = append(startedDispatcher, dispatcher)
+		}
 		fmt.Println("Start() err", err)
 	}
 
@@ -408,7 +418,7 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 
 		signedResults := make([]KeySignResult, 0)
 		commitableResults := make([]tss_helpers.BaseCommitment, 0)
-		for _, dsc := range dispatchers {
+		for _, dsc := range startedDispatcher {
 			resultPtr, err := dsc.Done().Await(context.Background())
 			// fmt.Println("result, err", resultPtr, err)
 
@@ -495,10 +505,14 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 					hiveTx := tssMgr.hiveClient.MakeTransaction([]hivego.HiveOperation{
 						deployOp,
 					})
+					tssMgr.hiveClient.PopulateSigningProps(&hiveTx, nil)
 					sig, _ := tssMgr.hiveClient.Sign(hiveTx)
 					hiveTx.AddSig(sig)
-					tssMgr.hiveClient.PopulateSigningProps(&hiveTx, nil)
-					tssMgr.hiveClient.Broadcast(hiveTx)
+					_, err = tssMgr.hiveClient.Broadcast(hiveTx)
+					if err != nil {
+						fmt.Println("Broadcast err", err)
+					}
+
 					// tssMgr.hiveClient.Broadcast([]hivego.HiveOperation{
 					// 	deployOp,
 					// }, &wif)
@@ -533,14 +547,16 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 
 						fmt.Println("serializedCircuit, err", serializedCircuit, err)
 
-						commitedResults[commitResult.SessionId] = struct {
-							err        error
-							circuit    *dids.SerializedCircuit
-							commitment tss_helpers.BaseCommitment
-						}{
-							err:        err,
-							circuit:    serializedCircuit,
-							commitment: commitResult,
+						if err == nil {
+							commitedResults[commitResult.SessionId] = struct {
+								err        error
+								circuit    *dids.SerializedCircuit
+								commitment tss_helpers.BaseCommitment
+							}{
+								err:        err,
+								circuit:    serializedCircuit,
+								commitment: commitResult,
+							}
 						}
 
 						wg.Done()
@@ -548,9 +564,11 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 				}
 				wg.Wait()
 
+				var canCommit bool = false
 				sigPacket := make(map[string]any, 0)
 				for _, signResult := range commitedResults {
 					if signResult.err == nil {
+						canCommit = true
 						sigPacket[signResult.commitment.SessionId] = map[string]any{
 							"type":         signResult.commitment.Type,
 							"session_id":   signResult.commitment.SessionId,
@@ -569,20 +587,25 @@ func (tssMgr *TssManager) RunActions(actions []QueuedAction, leader string, isLe
 				rawJson, err := json.Marshal(sigPacket)
 
 				fmt.Println("json.Marshal <err>", err)
-				deployOp := hivego.CustomJsonOperation{
-					RequiredAuths:        []string{tssMgr.config.Get().HiveUsername},
-					RequiredPostingAuths: []string{},
-					Id:                   "vsc.tss_commitment",
-					Json:                 string(rawJson),
-				}
+				if canCommit {
+					deployOp := hivego.CustomJsonOperation{
+						RequiredAuths:        []string{tssMgr.config.Get().HiveUsername},
+						RequiredPostingAuths: []string{},
+						Id:                   "vsc.tss_commitment",
+						Json:                 string(rawJson),
+					}
 
-				hiveTx := tssMgr.hiveClient.MakeTransaction([]hivego.HiveOperation{
-					deployOp,
-				})
-				sig, _ := tssMgr.hiveClient.Sign(hiveTx)
-				hiveTx.AddSig(sig)
-				tssMgr.hiveClient.PopulateSigningProps(&hiveTx, nil)
-				tssMgr.hiveClient.Broadcast(hiveTx)
+					hiveTx := tssMgr.hiveClient.MakeTransaction([]hivego.HiveOperation{
+						deployOp,
+					})
+					tssMgr.hiveClient.PopulateSigningProps(&hiveTx, nil)
+					sig, _ := tssMgr.hiveClient.Sign(hiveTx)
+					hiveTx.AddSig(sig)
+					_, err = tssMgr.hiveClient.Broadcast(hiveTx)
+					if err != nil {
+						fmt.Println("Broadcast err", err)
+					}
+				}
 			}
 		}
 
