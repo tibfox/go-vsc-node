@@ -122,6 +122,14 @@ func (s *StreamReader) Init() error {
 		lp = s.startBlock - 1
 	}
 
+	// guard against stale lastProcessed that's ahead of actual stored blocks
+	// (e.g. from a previous mainnet run when now on testnet)
+	highestBlock, err := s.hiveBlocks.GetHighestBlock()
+	if err == nil && highestBlock > 0 && lp > highestBlock {
+		log.Printf("[StreamReader] lastProcessed=%d exceeds highestBlock=%d, resetting", lp, highestBlock)
+		lp = highestBlock
+	}
+
 	s.lastProcessed = lp
 	s.lastSaved = &lp
 	return nil
@@ -194,6 +202,7 @@ func (s *StreamReader) pollDb(fail func(error)) {
 	cancel, errChan := s.hiveBlocks.ListenToBlockUpdates(s.ctx, s.lastProcessed, processBlock)
 	select {
 	case err := <-errChan:
+		log.Printf("[StreamReader] ListenToBlockUpdates error: %v", err)
 		fail(err)
 	case <-s.ctx.Done():
 		cancel()

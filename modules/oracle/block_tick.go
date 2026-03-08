@@ -22,13 +22,33 @@ type BlockTickHandler interface {
 }
 
 func (o *Oracle) blockTick(bh uint64, headHeight *uint64) {
+	if bh%5 == 0 {
+		if headHeight != nil {
+			log.Printf("[oracle] blockTick ENTRY bh=%d headHeight=%d diff=%d", bh, *headHeight, *headHeight-bh)
+		} else {
+			log.Printf("[oracle] blockTick ENTRY bh=%d headHeight=nil", bh)
+		}
+	}
+
 	if headHeight == nil {
+		return
+	}
+
+	// guard against underflow when bh > headHeight
+	if bh > *headHeight {
 		return
 	}
 
 	blockDiff := *headHeight - bh
 	if blockDiff > blockHeightThreshold {
+		if bh%5 == 0 {
+			log.Printf("[oracle] blockTick SKIPPED (catching up) bh=%d diff=%d", bh, blockDiff)
+		}
 		return
+	}
+
+	if bh%5 == 0 {
+		log.Printf("[oracle] blockTick bh=%d headHeight=%d diff=%d", bh, *headHeight, blockDiff)
 	}
 
 	slotInfo := stateEngine.CalculateSlotInfo(bh)
@@ -65,6 +85,7 @@ func (o *Oracle) blockTick(bh uint64, headHeight *uint64) {
 	)
 
 	signal := p2p.BlockTickSignal{
+		BlockHeight:    *headHeight,
 		IsProducer:     isProducer,
 		IsWitness:      isWitness,
 		ElectedMembers: members,
@@ -75,6 +96,8 @@ func (o *Oracle) blockTick(bh uint64, headHeight *uint64) {
 	// }
 
 	if isChainRelayTick {
+		log.Printf("[oracle] chain relay tick at block %d, isProducer=%v, isWitness=%v, username=%s",
+			*headHeight, isProducer, isWitness, username)
 		go o.chainOracle.HandleBlockTick(signal, o)
 	}
 }
