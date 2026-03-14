@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	DataLayer "vsc-node/lib/datalayer"
+	"vsc-node/lib/logger"
 	"vsc-node/modules/aggregate"
 	"vsc-node/modules/common"
 	systemconfig "vsc-node/modules/common/system-config"
@@ -146,7 +147,7 @@ func New(
 	txCrafter *transactionpool.TransactionCrafter,
 	txPool *transactionpool.TransactionPool,
 ) *ChainOracle {
-	logger := oracleLogger.With("prefix", "[CHAIN-RELAY]")
+	logger := logger.WithSlogPrefix(oracleLogger, "[CHAIN-RELAY]")
 
 	// Clone registered chains so this instance owns independent state.
 	chainRelayers := make(map[string]chainRelay, len(chainRegistry))

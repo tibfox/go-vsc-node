@@ -4,12 +4,12 @@ import (
 	"context"
 	ed25519Std "crypto/ed25519"
 	"errors"
-	"log"
 	"log/slog"
 	"os"
 	"time"
 	DataLayer "vsc-node/lib/datalayer"
 	"vsc-node/lib/dids"
+	"vsc-node/lib/logger"
 	"vsc-node/modules/aggregate"
 	"vsc-node/modules/common"
 	systemconfig "vsc-node/modules/common/system-config"
@@ -83,12 +83,7 @@ func New(
 		logLevel = slog.LevelDebug
 	}
 
-	logHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	})
-
-	logger := slog.New(logHandler).
-		With("prefix", "[ORACLE]")
+	logger := logger.NewSlogPrefixed("[ORACLE]", logLevel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -114,7 +109,7 @@ func New(
 // Init implements aggregate.Plugin.
 // Runs initialization in order of how they are passed in to `Aggregate`
 func (o *Oracle) Init() error {
-	log.Println("[oracle] Init: registering blockTick callback")
+	o.logger.Info("registering blockTick callback")
 	o.hiveConsumer.RegisterBlockTick("oracle", o.blockTick, true)
 
 	// Configure RPC connections for all chains from oracle config

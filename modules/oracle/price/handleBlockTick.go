@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
 	"math"
 	"slices"
 	"strings"
@@ -110,7 +109,7 @@ func pricePointCollector(
 			for _, pp := range pricePoints {
 				v, ok := appBuf[sym]
 				if !ok {
-					log.Println("unsupported symbol", sym)
+					p.logger.Warn("unsupported symbol", "symbol", sym)
 				}
 
 				pricePointExpired := timeThreshold.After(pp.CollectedAt)

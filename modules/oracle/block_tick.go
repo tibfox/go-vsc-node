@@ -1,7 +1,6 @@
 package oracle
 
 import (
-	"log"
 	"slices"
 	"vsc-node/lib/utils"
 	"vsc-node/modules/db/vsc/elections"
@@ -49,7 +48,7 @@ func (o *Oracle) blockTick(bh uint64, headHeight *uint64) {
 	// get elected members
 	result, err := o.electionDb.GetElectionByHeight(*headHeight)
 	if err != nil {
-		log.Println("[oracle] failed to get currently elected members.", err)
+		o.logger.Error("failed to get currently elected members", "err", err)
 		return
 	}
 

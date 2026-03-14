@@ -166,19 +166,19 @@ func (l *ltcChainData) Type() string {
 	return "LTC"
 }
 
-// getLtcBlockByHash fetches a single block and extracts its header.
-// Litecoin doesn't support getblockstats, so height is passed in.
+// getLtcBlockByHash fetches a block header by hash.
+// Uses GetBlockHeader instead of GetBlock to avoid deserializing
+// the full block, which fails on MWEB transactions (flag byte 0x08).
 func getLtcBlockByHash(
 	client *rpcclient.Client,
 	blockHash *chainhash.Hash,
 	knownHeight uint64,
 ) (*ltcChainData, error) {
-	block, err := client.GetBlock(blockHash)
+	header, err := client.GetBlockHeader(blockHash)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get block: %w", err)
+		return nil, fmt.Errorf("failed to get block header: %w", err)
 	}
 
-	header := &block.Header
 	return &ltcChainData{
 		Hash:        blockHash.String(),
 		Height:      knownHeight,

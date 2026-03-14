@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"vsc-node/lib/logger"
 	"vsc-node/modules/aggregate"
 	"vsc-node/modules/common"
 	"vsc-node/modules/oracle/p2p"
@@ -64,7 +65,7 @@ func New(
 	conf common.IdentityConfig,
 ) *PriceOracle {
 	var (
-		logger         = oracleLogger.With("prefix", "[PRICE]")
+		logger         = logger.WithSlogPrefix(oracleLogger, "[PRICE]")
 		pricePoints    = threadsafe.NewLockedConsumer[PricePointMap](256)
 		signedBlocks   = threadsafe.NewLockedConsumer[p2p.OracleBlock](256)
 		producerBlocks = threadsafe.NewLockedConsumer[p2p.OracleBlock](8)

@@ -167,19 +167,19 @@ func (d *dashChainData) Type() string {
 	return "DASH"
 }
 
-// getDashBlockByHash fetches a single block and extracts its header.
-// Unlike BTC, DASH doesn't support getblockstats, so height is passed in.
+// getDashBlockByHash fetches a block header by hash.
+// Uses GetBlockHeader instead of GetBlock to avoid deserializing
+// the full block, which may fail on DASH special transactions.
 func getDashBlockByHash(
 	client *rpcclient.Client,
 	blockHash *chainhash.Hash,
 	knownHeight uint64,
 ) (*dashChainData, error) {
-	block, err := client.GetBlock(blockHash)
+	header, err := client.GetBlockHeader(blockHash)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get block: %w", err)
+		return nil, fmt.Errorf("failed to get block header: %w", err)
 	}
 
-	header := &block.Header
 	return &dashChainData{
 		Hash:        blockHash.String(),
 		Height:      knownHeight,
