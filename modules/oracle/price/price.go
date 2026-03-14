@@ -64,7 +64,7 @@ func New(
 	conf common.IdentityConfig,
 ) *PriceOracle {
 	var (
-		logger         = oracleLogger.With("sub-service", "price-oracle")
+		logger         = oracleLogger.With("prefix", "[PRICE]")
 		pricePoints    = threadsafe.NewLockedConsumer[PricePointMap](256)
 		signedBlocks   = threadsafe.NewLockedConsumer[p2p.OracleBlock](256)
 		producerBlocks = threadsafe.NewLockedConsumer[p2p.OracleBlock](8)

@@ -25,7 +25,6 @@ package chain
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,12 +38,10 @@ import (
 	systemconfig "vsc-node/modules/common/system-config"
 	"vsc-node/modules/db/vsc/contracts"
 	"vsc-node/modules/db/vsc/elections"
-	"vsc-node/modules/hive/streamer"
 	transactionpool "vsc-node/modules/transaction-pool"
 
 	"github.com/chebyrash/promise"
 	"github.com/ipfs/go-cid"
-	"github.com/vsc-eco/hivego"
 )
 
 var (
@@ -131,7 +128,6 @@ type ChainOracle struct {
 	chainRelayers     map[string]chainRelay // symbol -> relayer instance
 	conf              common.IdentityConfig
 	sconf             systemconfig.SystemConfig
-	hiveConf          streamer.HiveConfig
 	electionDb        elections.Elections
 	contractState     contracts.ContractState
 	da                *DataLayer.DataLayer
@@ -144,14 +140,13 @@ func New(
 	oracleLogger *slog.Logger,
 	conf common.IdentityConfig,
 	sconf systemconfig.SystemConfig,
-	hiveConf streamer.HiveConfig,
 	electionDb elections.Elections,
 	contractState contracts.ContractState,
 	da *DataLayer.DataLayer,
 	txCrafter *transactionpool.TransactionCrafter,
 	txPool *transactionpool.TransactionPool,
 ) *ChainOracle {
-	logger := oracleLogger.With("sub-service", "chain-relay")
+	logger := oracleLogger.With("prefix", "[CHAIN-RELAY]")
 
 	// Clone registered chains so this instance owns independent state.
 	chainRelayers := make(map[string]chainRelay, len(chainRegistry))
@@ -166,7 +161,6 @@ func New(
 		chainRelayers:     chainRelayers,
 		conf:              conf,
 		sconf:             sconf,
-		hiveConf:          hiveConf,
 		electionDb:        electionDb,
 		contractState:     contractState,
 		da:                da,
@@ -215,43 +209,20 @@ func (c *ChainOracle) Init() error {
 // Start implements aggregate.Plugin.
 func (c *ChainOracle) Start() *promise.Promise[any] {
 
-	startSymbols := make(map[string]string)
 	for symbol, chainRelayer := range c.chainRelayers {
-		// Only attempt RPC connection for chains that are fully configured
-		// (have both a contract ID and RPC details). Skip the rest silently.
 		if chainRelayer.ContractId() == "" {
 			c.logger.Debug("chain relay not configured, skipping", "symbol", symbol)
 			continue
 		}
 
 		fcl, err := chainRelayer.GetLatestValidHeight()
-
 		if err != nil {
-			startSymbols[symbol] = err.Error()
 			c.logger.Error("failed to get latest chain height on startup", "symbol", symbol, "err", err)
 		} else {
-			startSymbols[symbol] = strconv.Itoa(int(fcl.blockHeight))
 			c.logger.Info("chain relay starting", "symbol", symbol, "height", fcl.blockHeight)
 		}
 	}
-	hiveURIs := streamer.DefaultHiveURIs
-	if c.hiveConf != nil {
-		if uris := c.hiveConf.GetHiveURIs(); len(uris) > 0 {
-			hiveURIs = uris
-		}
-	}
-	hiveClient := hivego.NewHiveRpc(hiveURIs)
-	hiveClient.ChainID = c.sconf.HiveChainId()
 
-	jsonBytes, _ := json.Marshal(startSymbols)
-	wif := c.conf.Get().HiveActiveKey
-	hiveClient.BroadcastJson(
-		[]string{c.conf.Get().HiveUsername},
-		[]string{},
-		"dev_vsc.chain_oracle",
-		string(jsonBytes),
-		&wif,
-	)
 	return promise.New(func(resolve func(any), _ func(error)) {
 		resolve(nil)
 	})

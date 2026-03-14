@@ -17,8 +17,8 @@ type ChainRpcConfig struct {
 //	{
 //	  "Chains": {
 //	    "BTC":  { "RpcHost": "bitcoind:48332",  "RpcUser": "user", "RpcPass": "pass" },
-//	    "DASH": { "RpcHost": "dashd:9998",      "RpcUser": "user", "RpcPass": "pass" },
-//	    "LTC":  { "RpcHost": "litecoind:9332",  "RpcUser": "user", "RpcPass": "pass" },
+//	    "DASH": { "RpcHost": "dashd:19998",     "RpcUser": "user", "RpcPass": "pass" },
+//	    "LTC":  { "RpcHost": "litecoind:19332", "RpcUser": "user", "RpcPass": "pass" },
 //	    "ETH":  { "RpcHost": "http://geth:8545" }
 //	  }
 //	}
@@ -74,16 +74,16 @@ func NewOracleConfig(dataDir ...string) OracleConfig {
 				RpcUser: "vsc-node-user",
 				RpcPass: "vsc-node-pass",
 			},
-			// "DASH": {
-			// 	RpcHost: "dashd:9998",
-			// 	RpcUser: "vsc-node-user",
-			// 	RpcPass: "vsc-node-pass",
-			// },
-			// "LTC": {
-			// 	RpcHost: "litecoind:9332",
-			// 	RpcUser: "vsc-node-user",
-			// 	RpcPass: "vsc-node-pass",
-			// },
+			"DASH": {
+				RpcHost: "dashd:19998",
+				RpcUser: "vsc-node-user",
+				RpcPass: "vsc-node-pass",
+			},
+			"LTC": {
+				RpcHost: "litecoind:19332",
+				RpcUser: "vsc-node-user",
+				RpcPass: "vsc-node-pass",
+			},
 			// "ETH": {
 			// 	RpcHost: "http://geth:8545",
 			// },

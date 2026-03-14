@@ -10,3 +10,8 @@ btc-data/*
 .DS_Store
 build
 cmd/mapping-bot/*datastore
+.ltc-data/
+.btc-data/
+.dash-data/
+vsc-contract-deploy
+vsc-node
