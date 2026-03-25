@@ -96,16 +96,18 @@ func (rss *rcSession) Consume(account string, blockHeight uint64, rcAmt int64) (
 }
 
 func (rss *rcSession) CanConsume(account string, blockHeight uint64, rcAmt int64) (bool, int64, int64) {
+	// Oracle DIDs are consensus-validated system accounts (2/3 BLS threshold).
+	// They have no HBD balance and should never be rate-limited by RCs.
+	if strings.HasPrefix(account, "did:vsc:oracle:") {
+		return true, math.MaxInt64, rcAmt
+	}
+
 	balAmt := rss.ledgerSession.GetBalance(account, blockHeight, "hbd")
 
 	if strings.HasPrefix(account, "hive:") {
 		//Give the user 5 HBD worth of RCs by default
 		//If user is Hive account
 		balAmt = balAmt + 5_000
-	} else if strings.HasPrefix(account, "did:vsc:oracle:") {
-		// Oracle DIDs are consensus-validated (2/3 BLS threshold) system accounts
-		// with no on-chain HBD balance, so grant them a large free RC allowance.
-		balAmt = balAmt + 5_000_000
 	}
 
 	frozeAmt := rss.rcSystem.GetFrozenAmt(account, blockHeight)
