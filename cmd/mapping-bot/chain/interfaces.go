@@ -36,6 +36,12 @@ type TxConfirmationDetails struct {
 	BlockHash   string
 	// TxIndex is the position of the transaction within the block (0-based).
 	TxIndex uint32
+	// IsInstantLocked is true when the chain natively supports InstantSend
+	// (currently only Dash) and dashd has accepted an LLMQ IS-lock for this
+	// tx. Independent of Confirmed: an IS-locked tx can be either in the
+	// mempool (Confirmed=false) or already in a block (Confirmed=true).
+	// Other chains always leave this false.
+	IsInstantLocked bool
 }
 
 // TxHistoryEntry is a chain-agnostic representation of a historical transaction

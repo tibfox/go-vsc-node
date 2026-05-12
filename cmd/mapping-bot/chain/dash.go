@@ -1,6 +1,8 @@
 package chain
 
 import (
+	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -53,6 +55,25 @@ func dashRPCEndpoint(envPrefix, defaultURL, defaultUser, defaultPass string) (ur
 	return
 }
 
+// dashAttachZMQ optionally wires a ZMQ pub-sub subscriber onto the dashd RPC
+// client. Controlled by `DASHD_{NETWORK}_ZMQ_URL` (e.g.
+// "tcp://vsc-dashd-testnet:28332"). Empty value → no ZMQ, client stays in
+// poll-only mode. Failures are logged and swallowed so a bad ZMQ config
+// doesn't take the whole bot down.
+func dashAttachZMQ(envPrefix string, rpc *DashdRPCClient, params *chaincfg.Params) {
+	endpoint := os.Getenv(envPrefix + "_ZMQ_URL")
+	if endpoint == "" {
+		return
+	}
+	zmq, err := NewDashdZMQSubscriber(context.Background(), endpoint)
+	if err != nil {
+		slog.Warn("dashd zmq: subscriber init failed; continuing in poll-only mode",
+			"endpoint", endpoint, "err", err)
+		return
+	}
+	rpc.AttachZMQ(zmq, params)
+}
+
 func NewDASHMainnet(httpClient *http.Client) *ChainConfig {
 	params := dashMainNetParams()
 	url, user, pass := dashRPCEndpoint(
@@ -60,10 +81,12 @@ func NewDASHMainnet(httpClient *http.Client) *ChainConfig {
 		"http://vsc-dashd-mainnet:9998",
 		"vsc-node-user", "vsc-node-pass",
 	)
+	rpc := NewDashdRPCClient(httpClient, url, user, pass)
+	dashAttachZMQ("DASHD_MAINNET", rpc, params)
 	return &ChainConfig{
 		Name:                 "dash",
 		AssetSymbol:          "DASH",
-		Client:               NewDashdRPCClient(httpClient, url, user, pass),
+		Client:               rpc,
 		Parser:               &BTCBlockParser{Params: params},
 		AddressGen:           &BTCAddressGenerator{Params: params, BackupCSVBlocks: 17280},
 		BlockInterval:        150 * time.Second, // 2.5 min blocks
@@ -82,10 +105,12 @@ func NewDASHTestnet(httpClient *http.Client) *ChainConfig {
 		"http://vsc-dashd-testnet:19998",
 		"vsc-node-user", "vsc-node-pass",
 	)
+	rpc := NewDashdRPCClient(httpClient, url, user, pass)
+	dashAttachZMQ("DASHD_TESTNET", rpc, params)
 	return &ChainConfig{
 		Name:                 "dash",
 		AssetSymbol:          "DASH",
-		Client:               NewDashdRPCClient(httpClient, url, user, pass),
+		Client:               rpc,
 		Parser:               &BTCBlockParser{Params: params},
 		AddressGen:           &BTCAddressGenerator{Params: params, BackupCSVBlocks: 2},
 		BlockInterval:        150 * time.Second,
@@ -110,7 +135,11 @@ func NewDASHRegtest(httpClient *http.Client) *ChainConfig {
 	return &ChainConfig{
 		Name:                 "dash",
 		AssetSymbol:          "DASH",
-		Client:               NewDashdRPCClient(httpClient, url, user, pass),
+		Client:               func() BlockchainClient {
+			rpc := NewDashdRPCClient(httpClient, url, user, pass)
+			dashAttachZMQ("DASHD_REGTEST", rpc, &chaincfg.RegressionNetParams)
+			return rpc
+		}(),
 		Parser:               &BTCBlockParser{Params: &chaincfg.RegressionNetParams},
 		AddressGen:           &BTCAddressGenerator{Params: &chaincfg.RegressionNetParams, BackupCSVBlocks: 2},
 		BlockInterval:        time.Second,

@@ -18,6 +18,7 @@ require (
 	github.com/ethereum/go-ethereum v1.14.12
 	github.com/go-playground/validator/v10 v10.27.0
 	github.com/go-viper/mapstructure/v2 v2.4.0
+	github.com/go-zeromq/zmq4 v0.17.0
 	github.com/hasura/go-graphql-client v0.13.1
 	github.com/ipfs/go-ds-flatfs v0.5.4
 	github.com/libp2p/go-libp2p-gorpc v0.6.0
@@ -50,6 +51,7 @@ require (
 	github.com/gammazero/chanqueue v1.0.0 // indirect
 	github.com/gammazero/deque v1.0.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/go-zeromq/goczmq/v4 v4.2.2 // indirect
 	github.com/gofrs/flock v0.8.1 // indirect
 	github.com/ipfs/go-cidutil v0.1.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect

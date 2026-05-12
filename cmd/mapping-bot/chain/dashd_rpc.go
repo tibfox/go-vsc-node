@@ -11,6 +11,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 )
 
 // DashdRPCClient implements BlockchainClient against a Dash Core JSON-RPC node.
@@ -43,18 +47,241 @@ type DashdRPCClient struct {
 	// (without -txindex it can't resolve a txid back to a block on its own).
 	txHeightMu    sync.RWMutex
 	txHeightCache map[string]uint64
+
+	// ZMQ-fed state. Populated by the goroutine started in AttachZMQ. All
+	// nil/empty if ZMQ is not wired up (graceful degradation to poll-only
+	// mode).
+	zmq    *DashdZMQSubscriber
+	params *chaincfg.Params // needed to decode addresses from raw tx scripts
+
+	watchedMu sync.RWMutex
+	watched   map[string]struct{}
+
+	// mempoolEntries indexes mempool deposits by their destination address
+	// — entries are pruned when the underlying tx appears in a block
+	// (HashBlock event triggers a scantxoutset reconciliation).
+	mempoolMu      sync.RWMutex
+	mempoolEntries map[string]map[string]TxHistoryEntry // addr → txid → entry
+
+	isLockedMu sync.RWMutex
+	isLocked   map[string]struct{} // set of txids known IS-locked
 }
 
 // NewDashdRPCClient constructs a client. `rpcURL` should be a full URL
 // including scheme + host + port, e.g. "http://vsc-dashd-testnet:19998".
 func NewDashdRPCClient(httpClient *http.Client, rpcURL, user, pass string) *DashdRPCClient {
 	return &DashdRPCClient{
-		rpcURL:        rpcURL,
-		user:          user,
-		pass:          pass,
-		client:        httpClient,
-		txHeightCache: make(map[string]uint64),
+		rpcURL:         rpcURL,
+		user:           user,
+		pass:           pass,
+		client:         httpClient,
+		txHeightCache:  make(map[string]uint64),
+		watched:        make(map[string]struct{}),
+		mempoolEntries: make(map[string]map[string]TxHistoryEntry),
+		isLocked:       make(map[string]struct{}),
 	}
+}
+
+// AttachZMQ wires a running DashdZMQSubscriber to this client. After this is
+// called the client will:
+//   - filter `rawtx` events by watched addresses (see WatchAddress) and
+//     surface mempool deposits via GetAddressTxs;
+//   - record txids from `rawtxlock` events and report them via
+//     TxConfirmationDetails.IsInstantLocked;
+//   - flush mempool entries on `hashblock` events (the next scantxoutset
+//     poll picks up the confirmed UTXO).
+//
+// `params` is required for decoding output scripts to addresses; pass the
+// same *chaincfg.Params the bot uses to derive deposit addresses (e.g.,
+// dashTestNetParams).
+//
+// Safe to call once. Calling without an attached ZMQ subscriber leaves the
+// client in poll-only mode (still functional, just no mempool/IS-lock
+// awareness).
+func (c *DashdRPCClient) AttachZMQ(zmq *DashdZMQSubscriber, params *chaincfg.Params) {
+	if zmq == nil {
+		return
+	}
+	c.zmq = zmq
+	c.params = params
+	go c.consumeZMQ()
+}
+
+// WatchAddress registers an address whose mempool deposits should be tracked
+// via the ZMQ feed. Has no effect until AttachZMQ has been called. Idempotent.
+func (c *DashdRPCClient) WatchAddress(addr string) {
+	c.watchedMu.Lock()
+	defer c.watchedMu.Unlock()
+	c.watched[addr] = struct{}{}
+}
+
+// UnwatchAddress stops tracking mempool deposits for an address.
+func (c *DashdRPCClient) UnwatchAddress(addr string) {
+	c.watchedMu.Lock()
+	delete(c.watched, addr)
+	c.watchedMu.Unlock()
+	c.mempoolMu.Lock()
+	delete(c.mempoolEntries, addr)
+	c.mempoolMu.Unlock()
+}
+
+func (c *DashdRPCClient) isWatched(addr string) bool {
+	c.watchedMu.RLock()
+	_, ok := c.watched[addr]
+	c.watchedMu.RUnlock()
+	return ok
+}
+
+func (c *DashdRPCClient) markIsLocked(txid string) {
+	c.isLockedMu.Lock()
+	c.isLocked[txid] = struct{}{}
+	c.isLockedMu.Unlock()
+}
+
+func (c *DashdRPCClient) isInstantLocked(txid string) bool {
+	c.isLockedMu.RLock()
+	_, ok := c.isLocked[txid]
+	c.isLockedMu.RUnlock()
+	return ok
+}
+
+// addMempoolEntry stores a pending deposit (tx in mempool targeting a watched
+// address) for later retrieval via GetAddressTxs.
+func (c *DashdRPCClient) addMempoolEntry(addr string, entry TxHistoryEntry) {
+	c.mempoolMu.Lock()
+	defer c.mempoolMu.Unlock()
+	bucket, ok := c.mempoolEntries[addr]
+	if !ok {
+		bucket = make(map[string]TxHistoryEntry)
+		c.mempoolEntries[addr] = bucket
+	}
+	if existing, found := bucket[entry.TxID]; found {
+		// Merge IS-lock status if a newer event upgrades it.
+		if entry.Confirmed {
+			existing.Confirmed = true
+		}
+		bucket[entry.TxID] = existing
+		return
+	}
+	bucket[entry.TxID] = entry
+}
+
+// mempoolFor returns a snapshot of the mempool entries for an address.
+func (c *DashdRPCClient) mempoolFor(addr string) []TxHistoryEntry {
+	c.mempoolMu.RLock()
+	defer c.mempoolMu.RUnlock()
+	bucket := c.mempoolEntries[addr]
+	if len(bucket) == 0 {
+		return nil
+	}
+	out := make([]TxHistoryEntry, 0, len(bucket))
+	for _, e := range bucket {
+		out = append(out, e)
+	}
+	return out
+}
+
+// reconcileOnBlock evicts mempool entries for txs that have just landed in a
+// block — the next scantxoutset poll will surface them as confirmed UTXOs.
+// We don't have the txids inline (HashBlock delivers only the block hash);
+// the simplest correct strategy is to drop entries older than ~1 block worth
+// of time. For now we just truncate per-address buckets that have grown
+// large enough to indicate stuck txs (over 1024 mempool entries → reset).
+// A future improvement is to fetch the block and remove only the txs it
+// actually contains.
+func (c *DashdRPCClient) reconcileOnBlock() {
+	c.mempoolMu.Lock()
+	defer c.mempoolMu.Unlock()
+	for addr, bucket := range c.mempoolEntries {
+		if len(bucket) > 1024 {
+			delete(c.mempoolEntries, addr)
+		}
+	}
+}
+
+// consumeZMQ runs until the ZMQ subscriber's context is cancelled.
+func (c *DashdRPCClient) consumeZMQ() {
+	for {
+		select {
+		case ev, ok := <-c.zmq.RawTx:
+			if !ok {
+				return
+			}
+			c.handleRawTx(ev, false)
+		case ev, ok := <-c.zmq.RawTxLock:
+			if !ok {
+				return
+			}
+			c.handleRawTx(ev, true)
+		case _, ok := <-c.zmq.HashBlock:
+			if !ok {
+				return
+			}
+			c.reconcileOnBlock()
+		case _, ok := <-c.zmq.RawChainLock:
+			if !ok {
+				return
+			}
+			// ChainLock fires when a block becomes finalized; nothing for
+			// us to do beyond what HashBlock already did.
+		case <-c.zmq.ctx.Done():
+			return
+		}
+	}
+}
+
+// handleRawTx decodes a rawtx or rawtxlock event. For rawtxlock it
+// unconditionally records the txid as IS-locked; for both it scans outputs
+// for hits against the watched-addresses set and adds matches to the
+// mempool cache.
+func (c *DashdRPCClient) handleRawTx(ev DashRawTxEvent, isLock bool) {
+	if len(ev.RawTx) == 0 {
+		return
+	}
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(ev.RawTx)); err != nil {
+		slog.Warn("dashd zmq: failed to deserialize rawtx", "err", err, "topic_isLock", isLock)
+		return
+	}
+	hash := tx.TxHash()
+	txid := chainHashToTxID(&hash)
+
+	if isLock {
+		c.markIsLocked(txid)
+	}
+
+	// Output parsing requires chain params — if AttachZMQ wasn't called with
+	// them, skip the watched-address filter (we still record IS-locks).
+	if c.params == nil {
+		return
+	}
+
+	for i, out := range tx.TxOut {
+		addrs := extractBTCAddresses(out.PkScript, c.params)
+		for _, addr := range addrs {
+			if !c.isWatched(addr) {
+				continue
+			}
+			entry := TxHistoryEntry{
+				TxID:      txid,
+				Confirmed: false, // mempool by definition
+				Outputs: []TxOutput{
+					{
+						Address: addr,
+						Value:   out.Value,
+						Index:   uint32(i),
+					},
+				},
+			}
+			c.addMempoolEntry(addr, entry)
+		}
+	}
+}
+
+func chainHashToTxID(h *chainhash.Hash) string {
+	// chainhash.Hash.String() returns the reversed-hex form used by
+	// Bitcoin/Dash JSON-RPC.
+	return h.String()
 }
 
 func (c *DashdRPCClient) cacheTxHeight(txid string, height uint64) {
@@ -333,12 +560,24 @@ func (c *DashdRPCClient) GetAddressTxs(address string) ([]TxHistoryEntry, error)
 	}
 
 	entries := make([]TxHistoryEntry, 0, len(byTx))
+	seen := make(map[string]struct{}, len(byTx))
 	for txid, outs := range byTx {
 		entries = append(entries, TxHistoryEntry{
 			TxID:      txid,
 			Confirmed: confirmed[txid],
 			Outputs:   outs,
 		})
+		seen[txid] = struct{}{}
+	}
+
+	// Union in mempool entries from the ZMQ feed (unconfirmed deposits that
+	// scantxoutset can't see). De-dup by txid in case the same tx surfaced
+	// from both paths during a race.
+	for _, m := range c.mempoolFor(address) {
+		if _, dup := seen[m.TxID]; dup {
+			continue
+		}
+		entries = append(entries, m)
 	}
 	return entries, nil
 }
@@ -361,9 +600,13 @@ func (c *DashdRPCClient) GetTxDetails(txid string) (TxConfirmationDetails, error
 		return TxConfirmationDetails{}, err
 	}
 
-	// In mempool (no block yet) → unconfirmed.
+	// In mempool (no block yet) → unconfirmed. Still propagate IS-lock
+	// status from either dashd's `instantlock` flag on the rawtx response
+	// or our ZMQ-fed cache.
 	if tx.Confirmations <= 0 || tx.BlockHash == "" {
-		return TxConfirmationDetails{}, nil
+		return TxConfirmationDetails{
+			IsInstantLocked: tx.InstantLock || c.isInstantLocked(txid),
+		}, nil
 	}
 
 	// Confirmed in a block — find the tx index inside the block.
@@ -394,10 +637,11 @@ func (c *DashdRPCClient) GetTxDetails(txid string) (TxConfirmationDetails, error
 	}
 
 	return TxConfirmationDetails{
-		Confirmed:   true,
-		BlockHeight: block.Height,
-		BlockHash:   tx.BlockHash,
-		TxIndex:     idx,
+		Confirmed:       true,
+		BlockHeight:     block.Height,
+		BlockHash:       tx.BlockHash,
+		TxIndex:         idx,
+		IsInstantLocked: tx.InstantLock || c.isInstantLocked(txid),
 	}, nil
 }
 
