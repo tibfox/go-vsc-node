@@ -107,3 +107,82 @@ func (d *Devnet) WaitForDashHeight(ctx context.Context, target uint64, timeout t
 		}
 	}
 }
+
+// EnsureDashCoinbaseMature mines enough blocks for the first coinbase to
+// be spendable. Dash regtest matures coinbase after 100 confirmations,
+// matching Bitcoin. We mine 105 to give a small buffer for fee math.
+// Returns the new tip height.
+func (d *Devnet) EnsureDashCoinbaseMature(ctx context.Context) (uint64, error) {
+	h, err := d.DashHeight(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("DashHeight: %w", err)
+	}
+	const target = uint64(105)
+	if h >= target {
+		return h, nil
+	}
+	return d.MineDashBlocks(ctx, int(target-h))
+}
+
+// SendDashToAddress sends `amount` (string DASH, e.g. "0.01") to `addr`
+// from the dashd regtest wallet. Returns the broadcast txid. Requires a
+// funded wallet — call EnsureDashCoinbaseMature first.
+func (d *Devnet) SendDashToAddress(ctx context.Context, addr, amount string) (string, error) {
+	out, err := d.dashCli(ctx, "sendtoaddress", addr, amount)
+	if err != nil {
+		return "", fmt.Errorf("sendtoaddress %s %s: %w", addr, amount, err)
+	}
+	return out, nil
+}
+
+// GetDashBlockHashAtHeight returns the block hash at the given height.
+func (d *Devnet) GetDashBlockHashAtHeight(ctx context.Context, height uint64) (string, error) {
+	return d.dashCli(ctx, "getblockhash", fmt.Sprint(height))
+}
+
+// GetDashRawBlockHex returns the raw block bytes (hex) for a given hash.
+// Verbosity 0 = serialized hex.
+func (d *Devnet) GetDashRawBlockHex(ctx context.Context, blockHash string) (string, error) {
+	return d.dashCli(ctx, "getblock", blockHash, "0")
+}
+
+// GetDashRawTransactionHex returns the raw serialized hex of a tx.
+// `blockHashHint` may be empty for mempool / -txindex paths; on a pruned
+// node we don't run, we'd need to pass it.
+func (d *Devnet) GetDashRawTransactionHex(ctx context.Context, txid, blockHashHint string) (string, error) {
+	args := []string{"getrawtransaction", txid}
+	if blockHashHint != "" {
+		args = append(args, "false", blockHashHint)
+	}
+	return d.dashCli(ctx, args...)
+}
+
+// GetDashTxConfirmationHeight returns the block height the tx was mined
+// into. Useful right after sendtoaddress + MineDashBlocks(1).
+func (d *Devnet) GetDashTxConfirmationHeight(ctx context.Context, txid string) (uint64, error) {
+	// `getrawtransaction <txid> 1` returns JSON with `blockhash` then
+	// `getblock <hash> 1` gives the height. Simpler path: scan the tip
+	// backwards until we find a block containing the txid; cheap in regtest
+	// because we control mining.
+	tip, err := d.DashHeight(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("DashHeight: %w", err)
+	}
+	for h := tip; h > 0 && h+50 > tip; h-- {
+		hash, err := d.GetDashBlockHashAtHeight(ctx, h)
+		if err != nil {
+			continue
+		}
+		// `getblock <hash> 1` lists the txids in the block.
+		raw, err := d.dashCli(ctx, "getblock", hash, "1")
+		if err != nil {
+			continue
+		}
+		// Trivial substring match — txid is unique, no quotes around the
+		// strings we care about would also contain it.
+		if strings.Contains(raw, txid) {
+			return h, nil
+		}
+	}
+	return 0, fmt.Errorf("txid %s not found in last 50 blocks", txid)
+}
