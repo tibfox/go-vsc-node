@@ -45,8 +45,11 @@ type DashdRPCClient struct {
 	// see a txid alongside its height (e.g., via scantxoutset). Used by
 	// getRawTxVerbose to supply the `blockhash` hint that pruned dashd needs
 	// (without -txindex it can't resolve a txid back to a block on its own).
+	// Bounded to maxTxHeightCacheEntries via FIFO eviction — no LRU needed
+	// because recency doesn't strongly correlate with future lookups.
 	txHeightMu    sync.RWMutex
 	txHeightCache map[string]uint64
+	txHeightOrder []string // FIFO eviction queue paired with the map
 
 	// ZMQ-fed state. Populated by the goroutine started in AttachZMQ. All
 	// nil/empty if ZMQ is not wired up (graceful degradation to poll-only
@@ -63,9 +66,17 @@ type DashdRPCClient struct {
 	mempoolMu      sync.RWMutex
 	mempoolEntries map[string]map[string]TxHistoryEntry // addr → txid → entry
 
-	isLockedMu sync.RWMutex
-	isLocked   map[string]struct{} // set of txids known IS-locked
+	isLockedMu    sync.RWMutex
+	isLocked      map[string]struct{} // set of txids known IS-locked
+	isLockedOrder []string            // FIFO eviction queue
 }
+
+// Bounds on long-lived caches. Picked so worst-case memory stays well under
+// 50 MB: 100k entries × ~80 bytes (key + map overhead) ≈ 8 MB per cache.
+const (
+	maxTxHeightCacheEntries = 100_000
+	maxIsLockedEntries      = 100_000
+)
 
 // NewDashdRPCClient constructs a client. `rpcURL` should be a full URL
 // including scheme + host + port, e.g. "http://vsc-dashd-testnet:19998".
@@ -134,8 +145,17 @@ func (c *DashdRPCClient) isWatched(addr string) bool {
 
 func (c *DashdRPCClient) markIsLocked(txid string) {
 	c.isLockedMu.Lock()
+	defer c.isLockedMu.Unlock()
+	if _, exists := c.isLocked[txid]; exists {
+		return
+	}
 	c.isLocked[txid] = struct{}{}
-	c.isLockedMu.Unlock()
+	c.isLockedOrder = append(c.isLockedOrder, txid)
+	if len(c.isLockedOrder) > maxIsLockedEntries {
+		evict := c.isLockedOrder[0]
+		c.isLockedOrder = c.isLockedOrder[1:]
+		delete(c.isLocked, evict)
+	}
 }
 
 func (c *DashdRPCClient) isInstantLocked(txid string) bool {
@@ -287,6 +307,15 @@ func chainHashToTxID(h *chainhash.Hash) string {
 func (c *DashdRPCClient) cacheTxHeight(txid string, height uint64) {
 	c.txHeightMu.Lock()
 	defer c.txHeightMu.Unlock()
+	if _, exists := c.txHeightCache[txid]; !exists {
+		// Only enqueue + evict on new insertions.
+		c.txHeightOrder = append(c.txHeightOrder, txid)
+		if len(c.txHeightOrder) > maxTxHeightCacheEntries {
+			evict := c.txHeightOrder[0]
+			c.txHeightOrder = c.txHeightOrder[1:]
+			delete(c.txHeightCache, evict)
+		}
+	}
 	c.txHeightCache[txid] = height
 }
 
