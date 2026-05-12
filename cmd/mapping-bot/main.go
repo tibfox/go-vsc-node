@@ -120,6 +120,26 @@ func main() {
 	defer cancel()
 	go mapBotHttpServer(httpCtx, db.Addresses, bot)
 
+	// Real-time deposit pipeline (Dash-only today): tell the chain client
+	// which addresses to watch in its ZMQ feed, then spawn a consumer that
+	// submits IS-locked deposits via the mapInstantSend action.
+	if mw, ok := bot.Chain.Client.(chain.MempoolWatcher); ok {
+		bootCtx, bootCancel := context.WithTimeout(httpCtx, 30*time.Second)
+		addrs, err := db.Addresses.GetByDateRange(bootCtx, time.Time{}, time.Now())
+		bootCancel()
+		if err != nil {
+			bot.L.Warn("failed to seed mempool watcher with existing addresses",
+				"err", err)
+		} else {
+			for _, am := range addrs {
+				mw.WatchAddress(am.ChainAddr)
+			}
+			bot.L.Info("mempool watcher seeded",
+				"chain", bot.Chain.Name, "addresses", len(addrs))
+		}
+	}
+	go bot.ConsumeDeposits(httpCtx)
+
 	var wg sync.WaitGroup
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

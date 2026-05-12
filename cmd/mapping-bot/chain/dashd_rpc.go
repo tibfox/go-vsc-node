@@ -69,6 +69,12 @@ type DashdRPCClient struct {
 	isLockedMu    sync.RWMutex
 	isLocked      map[string]struct{} // set of txids known IS-locked
 	isLockedOrder []string            // FIFO eviction queue
+
+	// deposits is the public real-time deposit-event channel. Fires for every
+	// rawtx / rawtxlock event whose outputs match a watched address. Buffer
+	// 256; events drop on overflow rather than block the ZMQ goroutine.
+	// Consumers should be promptly draining.
+	deposits chan DepositEvent
 }
 
 // Bounds on long-lived caches. Picked so worst-case memory stays well under
@@ -90,7 +96,13 @@ func NewDashdRPCClient(httpClient *http.Client, rpcURL, user, pass string) *Dash
 		watched:        make(map[string]struct{}),
 		mempoolEntries: make(map[string]map[string]TxHistoryEntry),
 		isLocked:       make(map[string]struct{}),
+		deposits:       make(chan DepositEvent, 256),
 	}
+}
+
+// Deposits exposes the real-time deposit-event channel — see DepositNotifier.
+func (c *DashdRPCClient) Deposits() <-chan DepositEvent {
+	return c.deposits
 }
 
 // AttachZMQ wires a running DashdZMQSubscriber to this client. After this is
@@ -276,6 +288,7 @@ func (c *DashdRPCClient) handleRawTx(ev DashRawTxEvent, isLock bool) {
 		return
 	}
 
+	rawHex := hex.EncodeToString(ev.RawTx)
 	for i, out := range tx.TxOut {
 		addrs := extractBTCAddresses(out.PkScript, c.params)
 		for _, addr := range addrs {
@@ -294,6 +307,20 @@ func (c *DashdRPCClient) handleRawTx(ev DashRawTxEvent, isLock bool) {
 				},
 			}
 			c.addMempoolEntry(addr, entry)
+
+			// Fire deposit event for the bot's IS-submission consumer.
+			// Non-blocking — drop on full buffer.
+			select {
+			case c.deposits <- DepositEvent{
+				TxID:          txid,
+				RawTxHex:      rawHex,
+				Address:       addr,
+				InstantLocked: isLock,
+			}:
+			default:
+				slog.Warn("dashd: deposit channel full, dropping event",
+					"txid", txid, "address", addr, "isLock", isLock)
+			}
 		}
 	}
 }

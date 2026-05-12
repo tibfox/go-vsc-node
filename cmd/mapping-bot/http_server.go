@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"time"
+	"vsc-node/cmd/mapping-bot/chain"
 	"vsc-node/cmd/mapping-bot/database"
 	"vsc-node/cmd/mapping-bot/mapper"
 
@@ -245,6 +246,13 @@ func requestHandler(
 			}
 		} else {
 			writeResponse(w, http.StatusCreated, "address mapping created: "+btcAddr+" -> "+requestBody.Instruction)
+		}
+
+		// Register this address with the real-time mempool watcher (Dash-only
+		// today). No-op for chains whose client doesn't implement the
+		// interface — they continue to rely on the polling flow.
+		if mw, ok := bot.Chain.Client.(chain.MempoolWatcher); ok {
+			mw.WatchAddress(btcAddr)
 		}
 
 		// handle this error, also allows test scripts witout bot

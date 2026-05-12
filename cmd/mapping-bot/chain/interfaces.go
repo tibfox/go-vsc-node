@@ -81,6 +81,47 @@ type AddressGenerator interface {
 	GenerateDepositAddress(primaryPubKeyHex, backupPubKeyHex, instruction string) (string, []byte, error)
 }
 
+// MempoolWatcher is an optional capability for chains whose client can be told
+// to track addresses for mempool deposits (via a ZMQ feed or similar). Chains
+// that don't support it return nil from `Chain.Client.(MempoolWatcher)`. The
+// mapping bot type-asserts on this interface — having it not implemented just
+// degrades the bot to confirmed-only deposit detection, no errors.
+type MempoolWatcher interface {
+	// WatchAddress registers an address whose mempool deposits should be
+	// tracked. Idempotent.
+	WatchAddress(addr string)
+	// UnwatchAddress stops tracking an address.
+	UnwatchAddress(addr string)
+}
+
+// DepositEvent is fired when a real-time chain feed sees a transaction whose
+// output pays a watched deposit address. Currently only emitted by the dashd
+// client (via its ZMQ subscriber); other clients leave the channel nil.
+type DepositEvent struct {
+	// TxID is the canonical txid (reversed-hex form) of the transaction.
+	TxID string
+	// RawTxHex is the serialized transaction encoded as hex, ready to put
+	// straight into a mapInstantSend payload.
+	RawTxHex string
+	// Address is the deposit address that was matched.
+	Address string
+	// InstantLocked is true when the event came from a ZMQ rawtxlock topic
+	// (the network has accepted an LLMQ IS-lock for this tx). False on plain
+	// rawtx events.
+	InstantLocked bool
+}
+
+// DepositNotifier is an optional capability for chains that emit real-time
+// deposit events. The mapping bot type-asserts on this interface and, when
+// available, runs a goroutine that consumes events and submits IS-locked txs
+// via the contract's mapInstantSend action.
+type DepositNotifier interface {
+	// Deposits returns a channel of deposit events. Implementations should
+	// return the same channel on every call. Closed when the underlying
+	// client is shut down.
+	Deposits() <-chan DepositEvent
+}
+
 // ChainConfig bundles all chain-specific components together.
 type ChainConfig struct {
 	// Name is the chain identifier (e.g., "btc", "ltc", "dash").
