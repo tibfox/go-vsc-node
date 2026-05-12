@@ -228,6 +228,133 @@ func TestDashDepositCreditFlow(t *testing.T) {
 		t.Logf("idempotency OK: balance stayed at %d duffs across two map calls", expected)
 	})
 
+	t.Run("Multi_Deposits_Same_Block", func(t *testing.T) {
+		// Two distinct deposit addresses, one tx each, all confirmed in the
+		// same block. Proves the parser can find multiple matches in one
+		// block and the contract handles multiple instructions per map call.
+		const userA = "multi-a"
+		const userB = "multi-b"
+		instrA := "deposit_to=hive:" + userA
+		instrB := "deposit_to=hive:" + userB
+
+		addrA, _, err := addrGen.GenerateDepositAddress(testPrimaryPubKeyHex, testBackupPubKeyHex, instrA)
+		if err != nil {
+			t.Fatalf("derive addr A: %v", err)
+		}
+		addrB, _, err := addrGen.GenerateDepositAddress(testPrimaryPubKeyHex, testBackupPubKeyHex, instrB)
+		if err != nil {
+			t.Fatalf("derive addr B: %v", err)
+		}
+
+		// Send to both BEFORE mining so they confirm in the same block.
+		const amtA = "0.004" // 400_000 duffs
+		const amtB = "0.006" // 600_000 duffs
+		txA, err := d.SendDashToAddress(ctx, addrA, amtA)
+		if err != nil {
+			t.Fatalf("sendto A: %v", err)
+		}
+		txB, err := d.SendDashToAddress(ctx, addrB, amtB)
+		if err != nil {
+			t.Fatalf("sendto B: %v", err)
+		}
+		t.Logf("queued multi-deposit: %s→%s (%s), %s→%s (%s)",
+			txA, addrA, amtA, txB, addrB, amtB)
+
+		// One block confirms both.
+		newTip, err := d.MineDashBlocks(ctx, 1)
+		if err != nil {
+			t.Fatalf("mine: %v", err)
+		}
+
+		// addBlocks the new header.
+		hdrHex, err := d.GetDashBlockHeaderHex(ctx, newTip)
+		if err != nil {
+			t.Fatalf("header at %d: %v", newTip, err)
+		}
+		addPayload := fmt.Sprintf(`{"blocks":"%s","latest_fee":1}`, hdrHex)
+		if _, err := d.CallContract(ctx, 1, contractId, "addBlocks", addPayload); err != nil {
+			t.Fatalf("addBlocks tip %d: %v", newTip, err)
+		}
+
+		// Parse the block — both deposits should be found.
+		blockHash, err := d.GetDashBlockHashAtHeight(ctx, newTip)
+		if err != nil {
+			t.Fatalf("blockhash: %v", err)
+		}
+		rawBlockHex, err := d.GetDashRawBlockHex(ctx, blockHash)
+		if err != nil {
+			t.Fatalf("getblock: %v", err)
+		}
+		rawBlock, err := hex.DecodeString(rawBlockHex)
+		if err != nil {
+			t.Fatalf("decode raw block: %v", err)
+		}
+		inputs, err := blockParser.ParseBlock(rawBlock, []string{addrA, addrB}, newTip)
+		if err != nil {
+			t.Fatalf("ParseBlock: %v", err)
+		}
+		if len(inputs) != 2 {
+			t.Fatalf("expected 2 inputs from block; got %d", len(inputs))
+		}
+
+		// Submit a map call for each input. Pass BOTH instructions so the
+		// contract can resolve whichever output address each tx happens to
+		// pay (we don't pre-sort inputs vs instructions).
+		for i, in := range inputs {
+			mapPayload, err := json.Marshal(struct {
+				TxData struct {
+					BlockHeight    uint32 `json:"block_height"`
+					RawTxHex       string `json:"raw_tx_hex"`
+					MerkleProofHex string `json:"merkle_proof_hex"`
+					TxIndex        uint32 `json:"tx_index"`
+				} `json:"tx_data"`
+				Instructions []string `json:"instructions"`
+			}{
+				TxData: struct {
+					BlockHeight    uint32 `json:"block_height"`
+					RawTxHex       string `json:"raw_tx_hex"`
+					MerkleProofHex string `json:"merkle_proof_hex"`
+					TxIndex        uint32 `json:"tx_index"`
+				}{
+					BlockHeight:    in.BlockHeight,
+					RawTxHex:       in.RawTxHex,
+					MerkleProofHex: in.MerkleProofHex,
+					TxIndex:        in.TxIndex,
+				},
+				Instructions: []string{instrA, instrB},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := d.CallContract(ctx, 1, contractId, "map", string(mapPayload)); err != nil {
+				t.Fatalf("map call %d/%d: %v", i+1, len(inputs), err)
+			}
+		}
+
+		// Verify both balances.
+		balA, err := d.WaitForContractState(ctx, 2, contractId, "a-hive:"+userA, 90*time.Second,
+			func(v []byte) bool { return DecodeContractBalance(v) > 0 },
+		)
+		if err != nil {
+			t.Fatalf("balance A: %v", err)
+		}
+		balB, err := d.WaitForContractState(ctx, 2, contractId, "a-hive:"+userB, 90*time.Second,
+			func(v []byte) bool { return DecodeContractBalance(v) > 0 },
+		)
+		if err != nil {
+			t.Fatalf("balance B: %v", err)
+		}
+		if got := DecodeContractBalance(balA); got != 400_000 {
+			t.Errorf("hive:%s expected 400_000 duffs, got %d", userA, got)
+		}
+		if got := DecodeContractBalance(balB); got != 600_000 {
+			t.Errorf("hive:%s expected 600_000 duffs, got %d", userB, got)
+		}
+		t.Logf("multi-deposit OK: hive:%s=%d, hive:%s=%d",
+			userA, DecodeContractBalance(balA),
+			userB, DecodeContractBalance(balB))
+	})
+
 	t.Run("MapInstantSend_Then_Map_NoDoubleCredit", func(t *testing.T) {
 		const hiveUser = "magi-4"
 		const instruction = "deposit_to=hive:" + hiveUser
@@ -313,6 +440,103 @@ func TestDashDepositCreditFlow(t *testing.T) {
 		}
 		t.Logf("IS+map idempotency OK: balance stayed at %d duffs, marker upgraded 1→2",
 			expectDuffs)
+	})
+
+	// MUST be the last subtest — leaves the contract paused-then-unpaused
+	// state, but to be safe we unpause at the end. Putting it last means a
+	// stuck pause doesn't cascade-fail earlier subtests.
+	t.Run("Pause_Rejects_Both_Map_Paths", func(t *testing.T) {
+		// Pause the contract — owner-only action.
+		if _, err := d.CallContract(ctx, 1, contractId, "pause", `""`); err != nil {
+			t.Fatalf("pause: %v", err)
+		}
+		// Wait for the paused state to land on chain.
+		if _, err := d.WaitForContractState(ctx, 2, contractId, "paused", 60*time.Second,
+			func(v []byte) bool { return string(v) == "1" },
+		); err != nil {
+			t.Fatalf("paused state never set to '1': %v", err)
+		}
+		t.Log("contract paused; verifying both map paths reject")
+
+		// ── (1) map path while paused ────────────────────────────────────
+		const userMap = "paused-map-user"
+		instrMap := "deposit_to=hive:" + userMap
+		addrMap, _, err := addrGen.GenerateDepositAddress(
+			testPrimaryPubKeyHex, testBackupPubKeyHex, instrMap,
+		)
+		if err != nil {
+			t.Fatalf("derive paused-map addr: %v", err)
+		}
+		// Send + confirm + addBlocks (addBlocks is NOT pause-gated). Build
+		// SPV proof and submit map() — call accepted by Hive but contract
+		// must abort with "contract is paused", leaving the balance empty.
+		input := sendAndConfirmDeposit(ctx, t, d, blockParser, addrMap, "0.002")
+		mapPayload := buildMapPayload(t, input, instrMap)
+		if _, err := d.CallContract(ctx, 1, contractId, "map", mapPayload); err != nil {
+			t.Fatalf("map call (paused): %v", err)
+		}
+		// Give time for a Hive block to land. The contract should reject
+		// internally — balance stays empty.
+		time.Sleep(12 * time.Second)
+		balMap, err := d.QueryContractState(ctx, 2, contractId, "a-hive:"+userMap)
+		if err != nil {
+			t.Fatalf("balance check (paused-map): %v", err)
+		}
+		if got := DecodeContractBalance(balMap); got > 0 {
+			t.Fatalf("PAUSE-BYPASS: paused contract credited %d duffs via map", got)
+		}
+		t.Log("paused map: balance stayed at 0 ✓")
+
+		// ── (2) mapInstantSend path while paused ─────────────────────────
+		const userIS = "paused-is-user"
+		instrIS := "deposit_to=hive:" + userIS
+		addrIS, _, err := addrGen.GenerateDepositAddress(
+			testPrimaryPubKeyHex, testBackupPubKeyHex, instrIS,
+		)
+		if err != nil {
+			t.Fatalf("derive paused-IS addr: %v", err)
+		}
+		txid, err := d.SendDashToAddress(ctx, addrIS, "0.003")
+		if err != nil {
+			t.Fatalf("send paused-IS: %v", err)
+		}
+		rawTxHex, err := d.GetDashRawTransactionHex(ctx, txid, "")
+		if err != nil {
+			t.Fatalf("getrawtransaction (paused-IS): %v", err)
+		}
+		isPayload, err := json.Marshal(struct {
+			RawTxHex     string   `json:"raw_tx_hex"`
+			Instructions []string `json:"instructions"`
+		}{
+			RawTxHex:     rawTxHex,
+			Instructions: []string{instrIS},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.CallContract(ctx, 1, contractId, "mapInstantSend", string(isPayload)); err != nil {
+			t.Fatalf("mapInstantSend call (paused): %v", err)
+		}
+		time.Sleep(12 * time.Second)
+		balIS, err := d.QueryContractState(ctx, 2, contractId, "a-hive:"+userIS)
+		if err != nil {
+			t.Fatalf("balance check (paused-IS): %v", err)
+		}
+		if got := DecodeContractBalance(balIS); got > 0 {
+			t.Fatalf("PAUSE-BYPASS: paused contract credited %d duffs via mapInstantSend", got)
+		}
+		t.Log("paused mapInstantSend: balance stayed at 0 ✓")
+
+		// ── Unpause and verify the gate flips back ────────────────────────
+		if _, err := d.CallContract(ctx, 1, contractId, "unpause", `""`); err != nil {
+			t.Fatalf("unpause: %v", err)
+		}
+		if _, err := d.WaitForContractState(ctx, 2, contractId, "paused", 60*time.Second,
+			func(v []byte) bool { return string(v) != "1" },
+		); err != nil {
+			t.Fatalf("paused state never cleared: %v", err)
+		}
+		t.Log("contract unpaused; pause-gate cycle complete")
 	})
 }
 
