@@ -103,6 +103,24 @@ func TestDashDepositCreditFlow(t *testing.T) {
 	}
 	t.Logf("dashd tip after coinbase maturity: %d", tip)
 
+	// ── Top up the deployer's VSC HBD ledger so its RC pool survives many
+	// contract calls. Each magi.testN witness ships with only the 10k-RC
+	// free tier; after seedBlocks + registerPublicKey + one addBlocks + one
+	// map() its RC is exhausted, RC_RETURN_PERIOD (~5 days) holds the
+	// freeze, and the next addBlocks gets gas=0 → "gas_limit_hit". Depositing
+	// `N` TBD into vsc.gateway with `to=magi.test1` credits `N*1000` sat-HBD
+	// on the VSC ledger; each sat-HBD funds 1 RC after the free tier.
+	//
+	// Sizing rule of thumb: this suite issues ~25 contract calls, each one
+	// costing ~5k RC on average (addBlocks/map heavy), so 500 TBD = 500_000
+	// RC headroom covers everything with a comfortable buffer. Tests that
+	// add more subtests should bump this proportionally rather than rely on
+	// the ~5-day RC_RETURN_PERIOD regen.
+	if err := d.FundVSCBalance("magi.test1", "500.000"); err != nil {
+		t.Fatalf("FundVSCBalance(magi.test1): %v", err)
+	}
+	time.Sleep(5 * time.Second)
+
 	// ── Deploy + initialize the contract ─────────────────────────────────
 	contractId, err := d.DeployContract(ctx, ContractDeployOpts{
 		WasmPath:     wasmPath,
@@ -131,7 +149,7 @@ func TestDashDepositCreditFlow(t *testing.T) {
 	t.Logf("seedBlocks(height=%d) submitted", seedHeight)
 
 	// registerPublicKey is owner-only — magi-1 is the deployer/owner.
-	regKeysPayload := fmt.Sprintf(`{"primary_pub_key":"%s","backup_pub_key":"%s"}`,
+	regKeysPayload := fmt.Sprintf(`{"primary_public_key":"%s","backup_public_key":"%s"}`,
 		testPrimaryPubKeyHex, testBackupPubKeyHex)
 	if _, err := d.CallContract(ctx, 1, contractId, "registerPublicKey", regKeysPayload); err != nil {
 		t.Fatalf("registerPublicKey: %v", err)
@@ -150,14 +168,19 @@ func TestDashDepositCreditFlow(t *testing.T) {
 
 	// ── Pre-compute the regtest address generator ───────────────────────
 	//
-	// MUST use chaincfg.RegressionNetParams (not the testnet Dash overrides)
-	// because the contract's regtest build branch uses vanilla regtest
-	// params via dashRegtestParams. Address bytes must round-trip.
-	addrGen := &chain.BTCAddressGenerator{
-		Params:          &chaincfg.RegressionNetParams,
-		BackupCSVBlocks: 2, // matches dash-mapping-contract regtest BackupCSVBlocks
+	// MUST apply the Dash regtest overrides (PubKeyHashAddrID=0x8c,
+	// ScriptHashAddrID=0x13) so the bot-side P2SH addresses round-trip
+	// with dash-mapping-contract::dashRegTestParams. The block parser
+	// extracts addresses via ExtractPkScriptAddrs which needs the same
+	// params to encode P2SH outputs into the expected base58 string.
+	regtestParams := chaincfg.RegressionNetParams
+	regtestParams.PubKeyHashAddrID = 0x8c
+	regtestParams.ScriptHashAddrID = 0x13
+	addrGen := &chain.DashAddressGenerator{
+		Params:          &regtestParams,
+		BackupCSVBlocks: 2,
 	}
-	blockParser := &chain.BTCBlockParser{Params: &chaincfg.RegressionNetParams}
+	blockParser := &chain.BTCBlockParser{Params: &regtestParams}
 
 	// ── Subtests ─────────────────────────────────────────────────────────
 
@@ -442,6 +465,15 @@ func TestDashDepositCreditFlow(t *testing.T) {
 			expectDuffs)
 	})
 
+	// Note: a "Sequential_AddBlocks_Many" subtest was tried here (5
+	// addBlocks calls in a row, asserting lastHeight monotonically advanced)
+	// but pushed the total contract-call count past the threshold where the
+	// devnet state engine's unpause propagation became unreliable. The
+	// addBlocks-loop sequencing is already exercised end-to-end by the
+	// other subtests (each one adds at least one block), so the extra
+	// subtest was net-negative on signal. Document the gap here in case
+	// the state-engine race gets a stable fix later.
+
 	// MUST be the last subtest — leaves the contract paused-then-unpaused
 	// state, but to be safe we unpause at the end. Putting it last means a
 	// stuck pause doesn't cascade-fail earlier subtests.
@@ -537,6 +569,13 @@ func TestDashDepositCreditFlow(t *testing.T) {
 			t.Fatalf("paused state never cleared: %v", err)
 		}
 		t.Log("contract unpaused; pause-gate cycle complete")
+		// Deposit-after-unpause smoke check intentionally NOT done here.
+		// Under the devnet state-engine's current settlement timing, adding
+		// even one more contract call after Pause's pause+map+IS+unpause
+		// chain reliably lets the unpause state lag past WaitForContractState's
+		// 60-120s window. The pause-clear assertion above is the load-bearing
+		// invariant; the resume-credit path is covered by the four prior
+		// subtests on a fresh devnet.
 	})
 }
 
@@ -647,7 +686,7 @@ func buildMapPayload(t *testing.T, input chain.MappingInput, instruction string)
 // asserts the expected duff amount lands at a-hive:<user>.
 func runDepositAndAssertCredit(
 	ctx context.Context, t *testing.T, d *Devnet,
-	addrGen *chain.BTCAddressGenerator,
+	addrGen chain.AddressGenerator,
 	parser *chain.BTCBlockParser,
 	depositAddr, instruction, hiveUser, sendAmount string,
 	expectDuffs int64,
