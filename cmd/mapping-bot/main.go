@@ -121,8 +121,17 @@ func main() {
 	go mapBotHttpServer(httpCtx, db.Addresses, bot)
 
 	// Real-time deposit pipeline (Dash-only today): tell the chain client
-	// which addresses to watch in its ZMQ feed, then spawn a consumer that
-	// submits IS-locked deposits via the mapInstantSend action.
+	// which addresses to watch in its ZMQ feed. The ZMQ subscriber stays
+	// passive — it populates the mempool cache + IS-locked txid set so
+	// GetAddressTxs/GetTxDetails are augmented with mempool data, but it
+	// does NOT auto-submit mapInstantSend unless explicitly enabled.
+	//
+	// Auto-submit is gated because the contract's `mapInstantSend` action is
+	// oracle-gated (checkOracle): the bot's eth-derived DID is not a valid
+	// caller, so submissions would just bounce. Until the oracle integration
+	// lands (or a login-service-driven path is wired up), keep the IS
+	// submission goroutine dormant. Operators with a properly-authorized
+	// caller can opt in via DASH_IS_AUTOSUBMIT=true.
 	if mw, ok := bot.Chain.Client.(chain.MempoolWatcher); ok {
 		bootCtx, bootCancel := context.WithTimeout(httpCtx, 30*time.Second)
 		addrs, err := db.Addresses.GetByDateRange(bootCtx, time.Time{}, time.Now())
@@ -138,7 +147,12 @@ func main() {
 				"chain", bot.Chain.Name, "addresses", len(addrs))
 		}
 	}
-	go bot.ConsumeDeposits(httpCtx)
+	if os.Getenv("DASH_IS_AUTOSUBMIT") == "true" {
+		bot.L.Info("DASH_IS_AUTOSUBMIT=true — enabling mapInstantSend auto-submission")
+		go bot.ConsumeDeposits(httpCtx)
+	} else {
+		bot.L.Info("DASH_IS_AUTOSUBMIT not set — mapInstantSend auto-submission disabled (use the normal map flow for credits)")
+	}
 
 	var wg sync.WaitGroup
 	for {
