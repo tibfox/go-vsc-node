@@ -56,7 +56,7 @@ func (b *Bot) HandleUnmap() {
 	if len(finishedTxs) > 0 {
 		txPairs := make([]*TxRawIdPair, len(finishedTxs))
 		for i, signedData := range finishedTxs {
-			txPair, err := attachSignatures(signedData)
+			txPair, err := b.attachSignatures(signedData)
 			// can just log the error and continue, because it will just refetch from contract
 			// state and try to compile it again
 			if err != nil {
@@ -266,9 +266,27 @@ func (b *Bot) CheckSignagures(
 	return fullySignedTxs, nil
 }
 
-func attachSignatures(signedData *database.Transaction) (*TxRawIdPair, error) {
+// attachSignatures finalises a fully-signed spending transaction by
+// embedding TSS signatures into each input. The assembly form depends
+// on the chain's address-encoding model:
+//
+//   - BTC and other SegWit chains: signatures + branch selector +
+//     witness script go into the TxIn.Witness stack, and the tx is
+//     serialized in BIP141 wire format (wire.WitnessEncoding).
+//   - Dash (no SegWit): signatures + branch selector + redeem script
+//     go into the TxIn.SignatureScript as a P2SH scriptSig, and the
+//     tx is serialized in legacy form (wire.BaseEncoding) — Dash Core's
+//     tx decoder actively rejects the BIP141 marker+flag bytes.
+//
+// The `WitnessScript` field on each UnsignedSigHash is a misnomer for
+// Dash inputs (it carries the redeem script in that case), but the
+// field name is preserved for on-wire msgpack compatibility with the
+// contract.
+func (b *Bot) attachSignatures(signedData *database.Transaction) (*TxRawIdPair, error) {
 	var tx wire.MsgTx
 	tx.Deserialize(bytes.NewReader(signedData.RawTx))
+
+	useP2SH := b.Chain.Name == "dash"
 
 	for _, inputData := range signedData.Signatures {
 		sig := signedData.Signatures[inputData.Index].Signature
@@ -276,23 +294,42 @@ func attachSignatures(signedData *database.Transaction) (*TxRawIdPair, error) {
 		copy(signature, sig)
 		signature[len(sig)] = byte(txscript.SigHashAll)
 
-		branchSelector := []byte{0x01} // primary key path (OP_IF)
-		if inputData.IsBackup {
-			branchSelector = []byte{} // backup key path (OP_ELSE)
+		if useP2SH {
+			// Build a P2SH scriptSig: push(sig+hashtype), push(branch
+			// selector), push(redeem script). Same stack the witness
+			// version assembled, just serialized as scriptSig instead.
+			sb := txscript.NewScriptBuilder()
+			sb.AddData(signature)
+			if inputData.IsBackup {
+				sb.AddOp(txscript.OP_0) // empty → falls to OP_ELSE branch
+			} else {
+				sb.AddOp(txscript.OP_1) // non-zero → OP_IF branch
+			}
+			sb.AddData(inputData.WitnessScript) // semantically the redeem script
+			scriptSig, err := sb.Script()
+			if err != nil {
+				return nil, err
+			}
+			tx.TxIn[inputData.Index].SignatureScript = scriptSig
+		} else {
+			branchSelector := []byte{0x01} // primary key path (OP_IF)
+			if inputData.IsBackup {
+				branchSelector = []byte{} // backup key path (OP_ELSE)
+			}
+			tx.TxIn[inputData.Index].Witness = wire.TxWitness{
+				signature[:],
+				branchSelector,
+				inputData.WitnessScript,
+			}
 		}
-		witness := wire.TxWitness{
-			signature[:],
-			branchSelector,
-			inputData.WitnessScript,
-		}
-
-		tx.TxIn[inputData.Index].Witness = witness
 	}
 
+	encoding := wire.WitnessEncoding
+	if useP2SH {
+		encoding = wire.BaseEncoding
+	}
 	var buf bytes.Buffer
-	// serialize is almost the same but with a different protocol version. Not sure if that
-	// actually changes the result
-	if err := tx.BtcEncode(&buf, wire.ProtocolVersion, wire.WitnessEncoding); err != nil {
+	if err := tx.BtcEncode(&buf, wire.ProtocolVersion, encoding); err != nil {
 		return nil, err
 	}
 

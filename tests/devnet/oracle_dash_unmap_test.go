@@ -12,22 +12,33 @@ import (
 
 // TestDashWithdrawalFlow is a scaffold for the end-to-end Dash withdrawal
 // (unmap → buildSpendTransaction → broadcast) path. It is intentionally
-// gated behind DASH_TEST_WITHDRAWAL=1 because the contract's spending path
-// is still incomplete:
+// gated behind DASH_TEST_WITHDRAWAL=1.
 //
-//   - HandleUnmap calls createP2SHAddressWithBackup for change addresses ✓
-//   - buildSpendTransaction calls createP2SHAddressWithBackup for the
-//     input UTXO redeem scripts ✓
-//   - …but the signed transaction is still serialized as a SegWit witness
-//     spend (TxIn.Witness, BIP143 sighash). Dash Core rejects SegWit
-//     decode entirely, so the broadcast will fail with -25
-//     "TX decode failed" or -26 "scriptpubkey".
+// Status of the prerequisites:
 //
-// Until that signing path is reworked to produce a P2SH scriptSig (redeem
-// script + signatures in scriptSig, BIP16 sighash, no witness section),
-// running this test only documents the gap. Once the rework lands, drop
-// the env-var gate and this test becomes the canonical proof that
-// withdrawals work end-to-end on Dash regtest.
+//   - HandleUnmap derives change addresses as P2SH ✓
+//   - buildSpendTransaction derives input redeem scripts via
+//     createP2SHAddressWithBackup ✓
+//   - signSpendTransaction produces BIP16 (legacy) sighashes via
+//     txscript.CalcSignatureHash, NOT BIP143 witness sighashes ✓
+//   - calculateP2SHFee accounts for non-SegWit scriptSig overhead ✓
+//   - The bot's attachSignatures assembles a P2SH scriptSig
+//     (push(sig+hashtype) push(branch) push(redeem)) and serializes
+//     in wire.BaseEncoding (no SegWit marker+flag bytes) on Dash ✓
+//
+// What still blocks a fully unattended end-to-end run:
+//
+//   - This test currently registers hardcoded test-vector pubkeys via
+//     registerPublicKey, NOT TSS-generated keys. The contract emits a
+//     real `sdk.TssSignKey` request when unmap runs, but the TSS
+//     service has no matching private share for the test-vector keys,
+//     so signatures never come back via getTssRequests.
+//   - To exercise a real broadcast, the test must instead call
+//     `createKeyPair` on the contract (which goes through TSS) and use
+//     the TSS-generated address as the deposit destination. Wiring
+//     that up means waiting for the createKeyPair TSS round to
+//     complete (~20–60 s in devnet), then deriving the deposit address
+//     from the resulting public keys for the deposit step.
 //
 // Run with:
 //
@@ -37,7 +48,7 @@ func TestDashWithdrawalFlow(t *testing.T) {
 		t.Skip("skipping devnet Dash withdrawal flow in short mode")
 	}
 	if os.Getenv("DASH_TEST_WITHDRAWAL") != "1" {
-		t.Skip("skipping until P2SH-signing rework lands; rerun with DASH_TEST_WITHDRAWAL=1 once buildSpendTransaction emits a P2SH scriptSig spend")
+		t.Skip("skipping until the test is wired up to use TSS-generated keys via createKeyPair; rerun with DASH_TEST_WITHDRAWAL=1 once the createKeyPair-driven setup is implemented")
 	}
 	requireDocker(t)
 
@@ -81,25 +92,34 @@ func TestDashWithdrawalFlow(t *testing.T) {
 	}
 	time.Sleep(5 * time.Second)
 
-	// ── INTENDED FLOW (to be wired up when signing rework lands) ────────
+	// ── INTENDED FLOW (to be wired up when TSS-key setup is added) ─────
 	//
-	// 1. Deploy + initialise the contract (seedBlocks + registerPublicKey).
-	// 2. Deposit DASH to a P2SH deposit address derived from the test keys
-	//    (same as TestDashDepositCreditFlow/Deposit_Credits_HiveUser).
-	// 3. Wait for the deposit to land as a contract balance (a-hive:<user>).
-	// 4. Call `unmap` with {amount, to:<external Dash address>}. The
-	//    contract should:
-	//       - Burn the balance
-	//       - Build a Dash-spending tx that consumes the deposit UTXO
-	//       - Return the rawtx hex (P2SH-scriptSig, NO witness)
-	// 5. Broadcast the rawtx via dash-cli sendrawtransaction. Dash Core
-	//    should accept it.
-	// 6. Mine a block and assert the recipient address received the funds
-	//    (via dash-cli getreceivedbyaddress).
-	// 7. Submit confirmSpend so the contract's UTXO accounting clears.
-	//
-	// The "should accept" step in (5) is currently the failure mode — the
-	// rawtx today carries a BIP141 witness section that Dash rejects.
+	// 1. Deploy the contract; call `createKeyPair` (NOT registerPublicKey)
+	//    and wait for the TSS round to complete. Pull the resulting
+	//    pubkey/backup_pubkey out of contract state for address derivation.
+	// 2. Seed the contract at the dashd tip.
+	// 3. Top up magi.test1's VSC HBD ledger via FundVSCBalance (≥ 500 TBD)
+	//    so the multi-call withdrawal flow doesn't blow the RC budget.
+	// 4. Deposit DASH to the P2SH deposit address derived from the TSS
+	//    pubkeys (same shape as TestDashDepositCreditFlow/Deposit_Credits_HiveUser).
+	// 5. Wait for the deposit to land as a contract balance (a-hive:<user>).
+	// 6. Call `unmap` with {amount, to:<external Dash regtest address>}.
+	//    Contract:
+	//       - Burns the balance
+	//       - Builds a P2SH-spending tx that consumes the deposit UTXO
+	//       - Emits TssSignKey requests for each input's sighash
+	//       - Stores SigningData under d-<txid> in contract state
+	// 7. Poll getTssRequests until every sighash has status=complete and
+	//    a signature is available. The TSS service in devnet will sign
+	//    automatically once the key shares produced in step 1 are usable.
+	// 8. Run the bot's attachSignatures equivalent: assemble the scriptSig
+	//    push(sig+hashtype, branch, redeem_script) and serialize with
+	//    wire.BaseEncoding (no witness).
+	// 9. Broadcast via dash-cli sendrawtransaction. Dash Core should
+	//    accept it (P2SH scriptSig spending a P2SH-wrapped redeem script).
+	// 10. Mine a block. Verify the recipient address received the funds via
+	//    dash-cli getreceivedbyaddress.
+	// 11. Submit confirmSpend so the contract's UTXO accounting clears.
 
-	t.Fatal("unmap flow not yet implemented; see TestDashWithdrawalFlow comment for the gating reason")
+	t.Fatal("unmap flow not yet implemented; see TestDashWithdrawalFlow comment for the TSS-key wiring gap")
 }
