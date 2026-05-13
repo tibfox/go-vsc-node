@@ -14,20 +14,21 @@ import (
 )
 
 // QueryContractState fetches the raw value of a single contract state key
-// via the magi node's GraphQL API. Returns the value as a []byte (which is
-// how the contract stores binary state).
+// via the magi node's GraphQL API (getStateByKeys with hex encoding).
+// Returns the value as a []byte (which is how the contract stores binary
+// state).
 //
-// On a state-not-found response from GraphQL, returns (nil, nil) — callers
-// must distinguish "no entry" from "empty entry" themselves.
+// On a state-not-found response, returns (nil, nil) — callers must
+// distinguish "no entry" from "empty entry" themselves.
 func (d *Devnet) QueryContractState(ctx context.Context, node int, contractId, key string) ([]byte, error) {
 	endpoint := d.GQLEndpoint(node)
 	query := map[string]any{
-		"query": `query($cid: String!, $key: String!) {
-			contractState(filterOptions:{contractId:$cid, key:$key}){ value }
+		"query": `query($cid: String!, $keys: [String!]!) {
+			getStateByKeys(contractId: $cid, keys: $keys, encoding: "hex")
 		}`,
 		"variables": map[string]any{
-			"cid": contractId,
-			"key": key,
+			"cid":  contractId,
+			"keys": []string{key},
 		},
 	}
 	body, err := json.Marshal(query)
@@ -57,9 +58,7 @@ func (d *Devnet) QueryContractState(ctx context.Context, node int, contractId, k
 
 	var parsed struct {
 		Data struct {
-			ContractState *struct {
-				Value string `json:"value"`
-			} `json:"contractState"`
+			GetStateByKeys map[string]any `json:"getStateByKeys"`
 		} `json:"data"`
 		Errors []any `json:"errors,omitempty"`
 	}
@@ -69,17 +68,66 @@ func (d *Devnet) QueryContractState(ctx context.Context, node int, contractId, k
 	if len(parsed.Errors) > 0 {
 		return nil, fmt.Errorf("graphql errors: %v", parsed.Errors)
 	}
-	if parsed.Data.ContractState == nil {
+	if parsed.Data.GetStateByKeys == nil {
 		return nil, nil
 	}
-	// Some magi nodes return the raw bytes as a Go-quoted string ("\\x0f\\x42\\x40")
-	// while others (newer schemas) base64-encode it. Try base64 first; if
-	// that doesn't parse, fall back to interpreting the string as raw bytes.
-	v := parsed.Data.ContractState.Value
-	if decoded := tryBase64Decode(v); decoded != nil {
-		return decoded, nil
+	raw, ok := parsed.Data.GetStateByKeys[key]
+	if !ok || raw == nil {
+		return nil, nil
 	}
-	return []byte(v), nil
+	s, ok := raw.(string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected state-value type %T (want string of hex)", raw)
+	}
+	if s == "" {
+		return nil, nil
+	}
+	// `encoding: "hex"` returns hex-encoded bytes.
+	bs, err := hexDecodeFlexible(s)
+	if err != nil {
+		return nil, fmt.Errorf("decode state hex %q: %w", s, err)
+	}
+	return bs, nil
+}
+
+// hexDecodeFlexible accepts either "0x..." or bare hex, and returns the
+// raw bytes. Empty string → empty slice.
+func hexDecodeFlexible(s string) ([]byte, error) {
+	if len(s) >= 2 && s[0:2] == "0x" {
+		s = s[2:]
+	}
+	if s == "" {
+		return nil, nil
+	}
+	return hexBytes(s)
+}
+
+func hexBytes(s string) ([]byte, error) {
+	b := make([]byte, len(s)/2)
+	for i := 0; i < len(b); i++ {
+		hi, err := hexNib(s[2*i])
+		if err != nil {
+			return nil, err
+		}
+		lo, err := hexNib(s[2*i+1])
+		if err != nil {
+			return nil, err
+		}
+		b[i] = (hi << 4) | lo
+	}
+	return b, nil
+}
+
+func hexNib(c byte) (byte, error) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', nil
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, nil
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, nil
+	}
+	return 0, fmt.Errorf("bad hex char %q", c)
 }
 
 // WaitForContractState polls QueryContractState until either:

@@ -128,9 +128,15 @@ func (d *Devnet) EnsureDashCoinbaseMature(ctx context.Context) (uint64, error) {
 // from the dashd regtest wallet. Returns the broadcast txid. Requires a
 // funded wallet — call EnsureDashCoinbaseMature first.
 func (d *Devnet) SendDashToAddress(ctx context.Context, addr, amount string) (string, error) {
-	out, err := d.dashCli(ctx, "sendtoaddress", addr, amount)
+	// Ensure the named wallet is loaded — loadwallet is idempotent enough
+	// for our purposes (returns an error "wallet is already loaded" we
+	// can ignore). createwallet would error on "wallet already exists";
+	// we don't need that branch here since EnsureDashCoinbaseMature
+	// has already created the devnet wallet.
+	_, _ = d.dashCli(ctx, "loadwallet", "devnet")
+	out, err := d.dashCli(ctx, "-rpcwallet=devnet", "sendtoaddress", addr, amount)
 	if err != nil {
-		return "", fmt.Errorf("sendtoaddress %s %s: %w", addr, amount, err)
+		return "", fmt.Errorf("sendtoaddress %s %s: %w (output: %s)", addr, amount, err, strings.TrimSpace(out))
 	}
 	return out, nil
 }
