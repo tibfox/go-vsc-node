@@ -33,12 +33,13 @@ import (
 //     real `sdk.TssSignKey` request when unmap runs, but the TSS
 //     service has no matching private share for the test-vector keys,
 //     so signatures never come back via getTssRequests.
-//   - To exercise a real broadcast, the test must instead call
-//     `createKeyPair` on the contract (which goes through TSS) and use
-//     the TSS-generated address as the deposit destination. Wiring
-//     that up means waiting for the createKeyPair TSS round to
-//     complete (~20–60 s in devnet), then deriving the deposit address
-//     from the resulting public keys for the deposit step.
+//   - To exercise a real broadcast, the test must instead call the
+//     `createKey` action (which goes through sdk.TssCreateKey), wait
+//     for the TSS round to complete (~20–60 s in devnet), fetch the
+//     resulting pubkeys from the TSS service via GraphQL, then call
+//     registerPublicKey with those TSS-owned pubkeys so the deposit
+//     address derivation lines up with shares the network can sign
+//     against.
 //
 // Run with:
 //
@@ -48,7 +49,7 @@ func TestDashWithdrawalFlow(t *testing.T) {
 		t.Skip("skipping devnet Dash withdrawal flow in short mode")
 	}
 	if os.Getenv("DASH_TEST_WITHDRAWAL") != "1" {
-		t.Skip("skipping until the test is wired up to use TSS-generated keys via createKeyPair; rerun with DASH_TEST_WITHDRAWAL=1 once the createKeyPair-driven setup is implemented")
+		t.Skip("skipping until the test is wired up to use TSS-generated keys via createKey + registerPublicKey-with-TSS-pubkey; rerun with DASH_TEST_WITHDRAWAL=1 once that setup is implemented")
 	}
 	requireDocker(t)
 
@@ -94,9 +95,12 @@ func TestDashWithdrawalFlow(t *testing.T) {
 
 	// ── INTENDED FLOW (to be wired up when TSS-key setup is added) ─────
 	//
-	// 1. Deploy the contract; call `createKeyPair` (NOT registerPublicKey)
-	//    and wait for the TSS round to complete. Pull the resulting
-	//    pubkey/backup_pubkey out of contract state for address derivation.
+	// 1. Deploy the contract; call `createKey` (which invokes
+	//    sdk.TssCreateKey under constants.TssKeyName), wait for the TSS
+	//    round to land, fetch the generated pubkeys via the TSS GraphQL
+	//    API, and finally call `registerPublicKey` with those TSS-owned
+	//    pubkeys. Both primary and backup are needed for the OP_IF/OP_ELSE
+	//    branches in the redeem script.
 	// 2. Seed the contract at the dashd tip.
 	// 3. Top up magi.test1's VSC HBD ledger via FundVSCBalance (≥ 500 TBD)
 	//    so the multi-call withdrawal flow doesn't blow the RC budget.
