@@ -14,7 +14,21 @@ import (
 // method. The caller is the witness at the given node index (1-indexed).
 // Retries up to 3 times on transient connection errors.
 func (d *Devnet) CallContract(ctx context.Context, node int, contractId, action, payload string) (string, error) {
+	return d.CallContractWithIntents(ctx, node, contractId, action, payload, nil)
+}
+
+// CallContractWithIntents is CallContract with an explicit intents list.
+// Used for actions that need to draw native HBD/HIVE via transfer.allow
+// (e.g. DEX add_liquidity, swaps with native input).
+func (d *Devnet) CallContractWithIntents(
+	ctx context.Context, node int, contractId, action, payload string,
+	intents []map[string]any,
+) (string, error) {
 	witnessName := fmt.Sprintf("%s%d", d.cfg.WitnessPrefix, node)
+
+	if intents == nil {
+		intents = []map[string]any{}
+	}
 
 	callTx := map[string]interface{}{
 		"net_id":      "vsc-devnet",
@@ -22,7 +36,7 @@ func (d *Devnet) CallContract(ctx context.Context, node int, contractId, action,
 		"action":      action,
 		"payload":     payload,
 		"rc_limit":    500000,
-		"intents":     []interface{}{},
+		"intents":     intents,
 	}
 	txJSON, err := json.Marshal(callTx)
 	if err != nil {

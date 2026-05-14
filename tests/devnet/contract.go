@@ -214,6 +214,49 @@ func DashMappingContractPath() (string, error) {
 	)
 }
 
+// DexRouterContractPath / DexPoolContractPath return absolute paths to the
+// prebuilt dex-router-v2 and dex pool WASM artifacts. Used by the Dash swap
+// devnet test (and reusable for any future DEX-integration test).
+//
+// Resolution order mirrors DashMappingContractPath: env override first, then
+// the sibling `dex-contracts/bin/` directory next to the utxo-mapping repo.
+
+func DexRouterContractPath() (string, error) {
+	return resolveDexWasm("DEX_ROUTER_WASM_PATH", "dex-router-v2.wasm")
+}
+
+func DexPoolContractPath() (string, error) {
+	return resolveDexWasm("DEX_POOL_WASM_PATH", "dex.wasm")
+}
+
+func resolveDexWasm(envVar, fileName string) (string, error) {
+	candidates := make([]string, 0, 2)
+	if p := os.Getenv(envVar); p != "" {
+		candidates = append(candidates, p)
+	}
+	candidates = append(candidates,
+		filepath.Join(findSourceRoot(), "..", "dex-contracts", "bin", fileName),
+	)
+
+	for _, p := range candidates {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() && info.Size() > 0 {
+			return abs, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"%s not found. Tried: %v\n"+
+			"Build it first:\n"+
+			"  cd <dex-contracts> && USE_DOCKER=1 make contracts\n"+
+			"Or set %s to an absolute path.",
+		fileName, candidates, envVar,
+	)
+}
+
 func parseContractId(output string) string {
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)

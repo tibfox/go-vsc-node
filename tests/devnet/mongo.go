@@ -33,6 +33,38 @@ type TssKeyDoc struct {
 	Epoch     uint64 `bson:"epoch"`
 }
 
+// LedgerBalanceDoc mirrors the ledger_balances MongoDB document shape used
+// by the VSC ledger ([modules/db/vsc/ledger/types.go]). One row is written
+// per account per block_height with a balance snapshot.
+type LedgerBalanceDoc struct {
+	Account     string `bson:"account"`
+	BlockHeight uint64 `bson:"block_height"`
+	Hive        int64  `bson:"hive"`
+	Hbd         int64  `bson:"hbd"`
+}
+
+// GetLedgerBalances returns all ledger_balances rows matching the filter
+// from a node's database (most-recent first by block_height is NOT
+// guaranteed; sort client-side if you need that).
+func (d *Devnet) GetLedgerBalances(ctx context.Context, node int, filter bson.M) ([]LedgerBalanceDoc, error) {
+	client, err := d.mongoClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Disconnect(ctx)
+
+	coll := client.Database(d.nodeDbName(node)).Collection("ledger_balances")
+	cursor, err := coll.Find(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("querying ledger_balances: %w", err)
+	}
+	var docs []LedgerBalanceDoc
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, fmt.Errorf("decoding ledger_balances: %w", err)
+	}
+	return docs, nil
+}
+
 // mongoClient returns a connected mongo client for the given node (1-indexed).
 // Each node has its own database: magi-1, magi-2, etc.
 func (d *Devnet) mongoClient(ctx context.Context) (*mongo.Client, error) {
