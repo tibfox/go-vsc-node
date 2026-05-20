@@ -267,21 +267,23 @@ Run a single test:
 go test -v -run TestTSSReshareHappyPath -timeout 25m ./tests/devnet/
 ```
 
-Run all integration tests (sequential, ~3-4 hours):
+Run all integration tests (sequential, ~5-6 hours):
 
 ```bash
-go test -v -run 'TestTSS|TestBlame|TestEdge|TestGossip' -timeout 300m ./tests/devnet/
+go test -v -run 'TestTSS|TestBlame|TestEdge|TestGossip|TestOracle|TestReview2' -timeout 420m ./tests/devnet/
 ```
 
 Or via the top-level Makefile (recommended):
 
 ```bash
-make regression           # full suite (~3-4h)
+make regression           # full suite (~5-6h)
 make regression-smoke     # devnet + contract-deploy sanity (~5-10min)
 make regression-tss       # TSS suite only
 make regression-blame     # blame suite only
 make regression-edge      # edge-case suite only
 make regression-gossip    # gossip-resilience suite only
+make regression-oracle    # oracle chain-relay + pruned-fetch suite
+make regression-review2   # review2 keystore-at-rest suite
 make regression-list      # print every Test* in tests/devnet/
 
 # Scope a custom run via overrides:
