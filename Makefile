@@ -20,7 +20,8 @@ GQL_GENERATED := modules/gql/gqlgen/generated.go
 GO_SOURCES := $(shell find modules lib -type f -name '*.go') go.mod go.sum
 
 # Targets
-.PHONY: all clean install magid contract-deployer genesis-elector devnet-setup mapping-bot generate
+.PHONY: all clean install magid contract-deployer genesis-elector devnet-setup mapping-bot generate \
+	regression regression-smoke regression-tss regression-blame regression-edge regression-gossip regression-list
 
 all: $(GQL_GENERATED) magid contract-deployer genesis-elector devnet-setup mapping-bot
 
@@ -72,3 +73,35 @@ install: all
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# ---- Regression / devnet integration tests --------------------------------
+# Docker-based integration suite under tests/devnet/. Heavy: needs Docker,
+# ~20GB free disk, multi-GB RAM. The full run is ~3-4 hours.
+# See tests/devnet/README.md for per-test descriptions.
+#
+# Override REGRESSION_FILTER / REGRESSION_TIMEOUT to scope a custom run, e.g.
+#   make regression REGRESSION_FILTER=TestTSSReshareHappyPath REGRESSION_TIMEOUT=25m
+
+REGRESSION_FILTER  ?= TestTSS|TestBlame|TestEdge|TestGossip
+REGRESSION_TIMEOUT ?= 300m
+
+regression:
+	go test -v -run '$(REGRESSION_FILTER)' -timeout $(REGRESSION_TIMEOUT) ./tests/devnet/
+
+regression-smoke:
+	go test -v -run 'TestDevnetSetup|TestDeployCallTss' -timeout 30m ./tests/devnet/
+
+regression-tss:
+	go test -v -run 'TestTSS' -timeout 120m ./tests/devnet/
+
+regression-blame:
+	go test -v -run 'TestBlame' -timeout 90m ./tests/devnet/
+
+regression-edge:
+	go test -v -run 'TestEdge' -timeout 120m ./tests/devnet/
+
+regression-gossip:
+	go test -v -run 'TestGossip' -timeout 30m ./tests/devnet/
+
+regression-list:
+	@cd tests/devnet && grep -h '^func Test' *_test.go | awk '{print $$2}' | sed 's/(.*//' | sort

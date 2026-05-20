@@ -273,6 +273,21 @@ Run all integration tests (sequential, ~3-4 hours):
 go test -v -run 'TestTSS|TestBlame|TestEdge|TestGossip' -timeout 300m ./tests/devnet/
 ```
 
+Or via the top-level Makefile (recommended):
+
+```bash
+make regression           # full suite (~3-4h)
+make regression-smoke     # devnet + contract-deploy sanity (~5-10min)
+make regression-tss       # TSS suite only
+make regression-blame     # blame suite only
+make regression-edge      # edge-case suite only
+make regression-gossip    # gossip-resilience suite only
+make regression-list      # print every Test* in tests/devnet/
+
+# Scope a custom run via overrides:
+make regression REGRESSION_FILTER=TestTSSReshareHappyPath REGRESSION_TIMEOUT=25m
+```
+
 ### Infrastructure / smoke tests
 
 | Test                    | File             | Description                                                                                                          |
