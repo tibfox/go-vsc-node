@@ -1,6 +1,8 @@
 package state_engine_test
 
 import (
+	"crypto/sha256"
+	"math/big"
 	"testing"
 
 	"vsc-node/modules/db/vsc/elections"
@@ -8,6 +10,8 @@ import (
 	ledgerSystem "vsc-node/modules/ledger-system"
 	stateEngine "vsc-node/modules/state-processing"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	btcecdsa "github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -212,6 +216,172 @@ func TestAuditDiff_114_BlockTxDecodeDoesNotPanicOnBadCID(t *testing.T) {
 	// before any DAG fetch is attempted.
 	_, err := bTx.Decode(nil, stateEngine.TxSelf{})
 	assert.Error(t, err, "audit #114/#115/#38: Decode of malformed CID must return an error (not panic)")
+}
+
+// =====================================================================
+// PR186 S3 — high-S TSS signature rejection
+// =====================================================================
+//
+// audit MED S3: pre-fix `state_engine.go` accepted any DER-parsed
+// ECDSA signature that passed `signature.Verify(...)`. ECDSA
+// signatures are MALLEABLE: for any valid `(r, s)`, `(r, N - s)`
+// is also valid. The post-fix code at state_engine.go:979-983
+// rejects non-canonical (high-S) signatures *before* calling Verify:
+//
+//   sigS := signature.S()
+//   if sigS.IsOverHalfOrder() {
+//       log.Warn("TSS signature has high-S (BIP-62 non-canonical), rejecting", ...)
+//       continue
+//   }
+//
+// The test exercises the underlying btcec behaviour directly: given
+// a legitimately-signed (low-S) sig, construct its high-S twin,
+// verify both VERIFY against the pubkey, but only the low-S form
+// passes `!IsOverHalfOrder()`.
+//
+// File:line of fix: modules/state-processing/state_engine.go:979-983
+
+func TestAuditDiff_S3_HighSSignatureIsMalleableButCaughtByIsOverHalfOrder(t *testing.T) {
+	// Generate a fresh ECDSA keypair on secp256k1.
+	priv, err := btcec.NewPrivateKey()
+	if err != nil {
+		t.Fatalf("NewPrivateKey: %v", err)
+	}
+
+	// Sign a fixed message (the same shape the TSS path signs:
+	// arbitrary 32-byte hash).
+	msg := sha256.Sum256([]byte("audit-diff-s3-test-msg"))
+	sig := btcecdsa.Sign(priv, msg[:])
+
+	// Sanity — the freshly produced signature must be canonical
+	// (low-S). btcec generates low-S by default; if this ever
+	// changes, the test setup will surface it.
+	lowS := sig.S()
+	if lowS.IsOverHalfOrder() {
+		t.Fatalf("btcec.Sign produced a high-S signature; test setup assumed low-S")
+	}
+	r := sig.R()
+	if !btcecdsa.NewSignature(&r, &lowS).Verify(msg[:], priv.PubKey()) {
+		t.Fatalf("low-S signature must verify against the signing pubkey")
+	}
+
+	// Construct the malleated (high-S) twin: s' = N - s.
+	// Convert btcec.ModNScalar ↔ *big.Int via the 32-byte serialisation.
+	curveN := btcec.S256().N
+	var sBytes [32]byte
+	lowS.PutBytes(&sBytes)
+	sBig := new(big.Int).SetBytes(sBytes[:])
+	nMinusS := new(big.Int).Sub(curveN, sBig)
+	var highS btcec.ModNScalar
+	if overflow := highS.SetByteSlice(nMinusS.Bytes()); overflow {
+		t.Fatalf("N - s overflowed ModNScalar (impossible by construction)")
+	}
+	highSig := btcecdsa.NewSignature(&r, &highS)
+
+	// The malleated sig must still pass Verify (the precondition
+	// that made the pre-fix code vulnerable — a malicious node could
+	// resubmit any signed result as its high-S twin and have it
+	// accepted as a distinct valid signature).
+	assert.True(t, highSig.Verify(msg[:], priv.PubKey()),
+		"audit S3 precondition: the malleated high-S signature must still verify against the pubkey "+
+			"(this is the whole reason the audit flagged this — without the IsOverHalfOrder gate, "+
+			"pre-fix would accept it as a 'second valid signature')")
+
+	// Post-fix gate must flag the malleated signature as high-S.
+	highSReturned := highSig.S()
+	assert.True(t, highSReturned.IsOverHalfOrder(),
+		"audit S3: malleated high-S sig must be flagged by IsOverHalfOrder(); the post-fix gate at "+
+			"state_engine.go:980 rejects it before calling Verify")
+
+	// And the original low-S sig must NOT be flagged.
+	lowSAgain := sig.S()
+	assert.False(t, lowSAgain.IsOverHalfOrder(),
+		"audit S3: legitimate low-S sig must NOT trigger the gate (or the gate would reject all "+
+			"signatures and break TSS sign entirely)")
+}
+
+// =====================================================================
+// PR185 #118 — GetLedgerRange (nil, err) nil-deref crash fix
+// =====================================================================
+//
+// audit MED #118: pre-fix `UpdateBalances` in state_engine.go did:
+//
+//   ledgerUpdates, _ := se.LedgerState.LedgerDb.GetLedgerRange(...)
+//   hasLedgerUpdates := len(*ledgerUpdates) > 0
+//
+// The MongoDB `GetLedgerRange` returns `(nil, err)` on a Find error.
+// The discarded error + `*ledgerUpdates` dereference then panicked
+// the entire slot-flush goroutine.
+//
+// The post-fix code at state_engine.go:1766-1776 checks the error
+// AND nil pointer before dereferencing:
+//
+//   ledgerUpdates, err := ...
+//   if err != nil || ledgerUpdates == nil {
+//       log.Error("balance snapshot skipped: ...")
+//       continue
+//   }
+//   hasLedgerUpdates := len(*ledgerUpdates) > 0
+//
+// We can't easily drive `UpdateBalances` end-to-end from a unit test
+// (it's deep inside the slot-flush path and depends on a full state
+// engine + ledger system + claim db wiring). The test below instead
+// asserts the failure mode the pre-fix code exhibited — `len(*nil)`
+// on a nil-typed pointer panics with "runtime error: invalid memory
+// address" — by directly executing the pre-fix and post-fix patterns
+// against a nil result.
+//
+// File:line of fix: modules/state-processing/state_engine.go:1766-1776
+
+func TestAuditDiff_118_NilLedgerRangeDoesNotPanic(t *testing.T) {
+	// Post-fix pattern: check err / nil before deref. This MUST NOT panic.
+	t.Run("post_fix_pattern", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("audit #118 post-fix pattern panicked: %v", r)
+			}
+		}()
+
+		var nilLedgerUpdates *[]ledgerDb.LedgerRecord
+		var err = assertedDBError()
+
+		// This is the post-fix structure verbatim (modulo logger).
+		if err != nil || nilLedgerUpdates == nil {
+			// The continue is unobservable here; just exit.
+			return
+		}
+		// Pre-fix would have called this unconditionally.
+		_ = len(*nilLedgerUpdates) > 0
+	})
+
+	// Pre-fix pattern: deref nil unconditionally. This MUST panic.
+	// The test confirms that the failure mode the audit identified
+	// is real — `*nil` on a typed nil pointer triggers a runtime
+	// panic.
+	t.Run("pre_fix_pattern_panics", func(t *testing.T) {
+		var panicked bool
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+			if !panicked {
+				t.Fatalf("audit #118 pre-fix pattern did NOT panic on nil deref — " +
+					"either Go's runtime changed or the audit's failure mode no longer holds. " +
+					"Pre-fix code at state_engine.go did: " +
+					"`ledgerUpdates, _ := GetLedgerRange(...); len(*ledgerUpdates)` " +
+					"which panics on nil. This test guards against that ever being safe.")
+			}
+		}()
+
+		var nilLedgerUpdates *[]ledgerDb.LedgerRecord
+		_ = len(*nilLedgerUpdates) > 0 // expected to panic
+	})
+}
+
+// assertedDBError returns a sentinel error standing in for a MongoDB
+// failure that `GetLedgerRange` would propagate post-fix.
+func assertedDBError() error {
+	return assert.AnError
 }
 
 // =====================================================================
