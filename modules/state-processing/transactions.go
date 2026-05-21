@@ -687,8 +687,7 @@ func (tx *TxConsensusStake) ExecuteTx(
 		}
 	}
 
-	if (strings.HasPrefix(tx.To, "did:") || !strings.HasPrefix(tx.To, "hive:")) ||
-		(!strings.HasPrefix(tx.From, "did:") && !strings.HasPrefix(tx.From, "hive:")) {
+	if !strings.HasPrefix(tx.To, "hive:") || !strings.HasPrefix(tx.From, "hive:") {
 		return TxResult{
 			Success: false,
 			Ret:     "Invalid to/from",
@@ -788,8 +787,7 @@ func (tx *TxConsensusUnstake) ExecuteTx(
 			RcUsed:  50,
 		}
 	}
-	if (strings.HasPrefix(tx.To, "did:") && !strings.HasPrefix(tx.To, "hive:")) ||
-		(strings.HasPrefix(tx.From, "did:") || !strings.HasPrefix(tx.From, "hive:")) {
+	if !strings.HasPrefix(tx.To, "hive:") || !strings.HasPrefix(tx.From, "hive:") {
 		return TxResult{
 			Success: false,
 			Ret:     "Invalid to/from",
@@ -818,7 +816,7 @@ func (tx *TxConsensusUnstake) ExecuteTx(
 		}
 	}
 
-	electionResult := se.GetElectionInfo(tx.Self.BlockHeight - 1)
+	electionResult := se.GetElectionInfo(tx.Self.BlockHeight)
 
 	params := ledgerSystem.ConsensusParams{
 		Id:            MakeTxId(tx.Self.TxId, tx.Self.OpIndex),
