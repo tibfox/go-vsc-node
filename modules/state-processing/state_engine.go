@@ -1201,7 +1201,11 @@ func (se *StateEngine) ProcessBlock(block hive_blocks.HiveBlock) {
 	//Detects new slot and executes batch if so
 	if se.slotStatus.SlotHeight != slotInfo.StartHeight {
 		//Updates balances index before next batch can execute
-		vscBlock, _ := se.vscBlocks.GetBlockByHeight(se.slotStatus.SlotHeight - 1)
+		vscBlock, err := se.vscBlocks.GetBlockByHeight(se.slotStatus.SlotHeight - 1)
+		if err != nil && err != mongo.ErrNoDocuments {
+			log.Error("GetBlockByHeight failed, falling back to full-range balance scan",
+				"slotHeight", se.slotStatus.SlotHeight, "err", err)
+		}
 
 		startBlock := uint64(0)
 		if vscBlock != nil {
@@ -1453,7 +1457,11 @@ func (se *StateEngine) committeeAccountsAtHeight(height uint64) []string {
 
 func (se *StateEngine) ExecuteBatch() {
 
-	lastBlock, _ := se.vscBlocks.GetBlockByHeight(se.slotStatus.SlotHeight)
+	lastBlock, err := se.vscBlocks.GetBlockByHeight(se.slotStatus.SlotHeight)
+	if err != nil && err != mongo.ErrNoDocuments {
+		log.Error("GetBlockByHeight failed in ExecuteBatch, falling back to lastBlockBh=0",
+			"slotHeight", se.slotStatus.SlotHeight, "err", err)
+	}
 
 	var lastBlockBh uint64
 	if lastBlock == nil {
@@ -1698,7 +1706,11 @@ func (se *StateEngine) UpdateBalances(startBlock, endBlock uint64) {
 	// se.LedgerExecutor.Ls.ActionsDb.ExecuteComplete(nil, completeIds...)
 
 	//log.Debug("stBlock, endBlock", stBlock, endBlock)
-	distinctAccounts, _ := se.LedgerState.LedgerDb.GetDistinctAccountsRange(stBlock, endBlock)
+	distinctAccounts, err := se.LedgerState.LedgerDb.GetDistinctAccountsRange(stBlock, endBlock)
+	if err != nil {
+		log.Error("GetDistinctAccountsRange failed, balance snapshots may be incomplete this slot",
+			"stBlock", stBlock, "endBlock", endBlock, "err", err)
+	}
 
 	//Ensure system:fr_balance is always processed so its hbd_claim stays current.
 	//Its interest goes to hive:vsc.dao, so it never appears in distinctAccounts via
@@ -1745,7 +1757,17 @@ func (se *StateEngine) UpdateBalances(startBlock, endBlock uint64) {
 		//As of block X or below
 		// se.LedgerExecutor.Ls.log.Debug("GetBalance for account", stBlock, stHeight, endBlock)
 
-		ledgerUpdates, _ := se.LedgerState.LedgerDb.GetLedgerRange(k, stHeight, endBlock, "")
+		ledgerUpdates, err := se.LedgerState.LedgerDb.GetLedgerRange(k, stHeight, endBlock, "")
+		if err != nil || ledgerUpdates == nil {
+			// Balance snapshot for this account will be stale until the account's
+			// next ledger activity, when stHeight catches up. Ledger records
+			// (source of truth) are intact in MongoDB — only the derived balance
+			// cache is affected. A node crash would be strictly worse: all
+			// accounts would lose their snapshot update, not just this one.
+			log.Error("balance snapshot skipped: GetLedgerRange failed; ledger records intact, snapshot stale until next activity",
+				"account", k, "rangeStart", stHeight, "rangeEnd", endBlock, "err", err)
+			continue
+		}
 
 		hasLedgerUpdates := len(*ledgerUpdates) > 0
 
