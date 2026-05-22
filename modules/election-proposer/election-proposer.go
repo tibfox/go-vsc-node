@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +232,19 @@ const VSC_ELECTION_TX_ID = "vsc.election_result"
 // that's still catching up — the score threshold (75%) over a tiny
 // denominator can mis-ban everyone, so we skip the filter and rely on
 // later elections (with more history) to catch persistent delinquency.
-const scoreMapMinSamples = 500
+//
+// Production default is 500 (about 25 elections at ElectionInterval=20).
+// Devnet tests override via VSC_ELECTION_SCOREMAP_MIN_SAMPLES so the
+// ban filter activates within a runnable test horizon.
+var scoreMapMinSamples = uint64(500)
+
+func init() {
+	if v := os.Getenv("VSC_ELECTION_SCOREMAP_MIN_SAMPLES"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			scoreMapMinSamples = n
+		}
+	}
+}
 
 func (e *electionProposer) GenerateFullElection(
 	witnessList []witnesses.Witness,
