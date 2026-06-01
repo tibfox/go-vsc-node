@@ -240,7 +240,7 @@ func (ms *MultiSig) TickKeyRotation(bh uint64) {
 		tx.AddSig(sig)
 	}
 
-	if weight == uint64(threshold) {
+	if weight >= uint64(threshold) {
 		rotationId, err := ms.hiveCreator.Broadcast(tx)
 
 		fmt.Println("Rotation txId", rotationId, err)
@@ -295,7 +295,7 @@ func (ms *MultiSig) TickActions(bh uint64) {
 		tx.AddSig(sig)
 	}
 
-	if weight == uint64(threshold) {
+	if weight >= uint64(threshold) {
 		rotationId, err := ms.hiveCreator.Broadcast(tx)
 
 		fmt.Println("Actions txId", rotationId, err)
@@ -350,7 +350,7 @@ func (ms *MultiSig) TickSyncFr(bh uint64) {
 		tx.AddSig(sig)
 	}
 
-	if weight == uint64(threshold) {
+	if weight >= uint64(threshold) {
 		rotationId, err := ms.hiveCreator.Broadcast(tx)
 
 		fmt.Println("SyncFr txId", rotationId, err)
