@@ -135,7 +135,7 @@ func TestRequestHandler(t *testing.T) {
 	t.Run("201 created", func(t *testing.T) {
 		req := jsonRequest(t, http.MethodPost, "/", body)
 		w := httptest.NewRecorder()
-		requestHandler(t.Context(), bot).ServeHTTP(w, req)
+		requestHandler(t.Context(), bot, newRateLimiterMap()).ServeHTTP(w, req)
 		assert.Equal(t, http.StatusCreated, w.Code)
 
 		stored, err := db.Addresses.GetInstruction(t.Context(), expectedAddr)
@@ -146,21 +146,21 @@ func TestRequestHandler(t *testing.T) {
 	t.Run("200 idempotent on duplicate", func(t *testing.T) {
 		req := jsonRequest(t, http.MethodPost, "/", body)
 		w := httptest.NewRecorder()
-		requestHandler(t.Context(), bot).ServeHTTP(w, req)
+		requestHandler(t.Context(), bot, newRateLimiterMap()).ServeHTTP(w, req)
 		assert.Equal(t, http.StatusOK, w.Code)
 	})
 
 	t.Run("400 bad request missing instruction", func(t *testing.T) {
 		req := jsonRequest(t, http.MethodPost, "/", map[string]string{})
 		w := httptest.NewRecorder()
-		requestHandler(t.Context(), bot).ServeHTTP(w, req)
+		requestHandler(t.Context(), bot, newRateLimiterMap()).ServeHTTP(w, req)
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 	})
 
 	t.Run("405 method not allowed", func(t *testing.T) {
 		req := jsonRequest(t, http.MethodGet, "/", body)
 		w := httptest.NewRecorder()
-		requestHandler(t.Context(), bot).ServeHTTP(w, req)
+		requestHandler(t.Context(), bot, newRateLimiterMap()).ServeHTTP(w, req)
 		assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
 	})
 }

@@ -182,6 +182,16 @@ func (ms *MultiSig) BlockTick(bh uint64, headHeight *uint64) {
 			return
 		}
 
+		// review6 M7: skip all fund-affecting ticks when the gateway is in
+		// emergency-halt mode. The witness still produces blocks and
+		// participates in everything else (consensus, gossip, RC, oracle
+		// feeds); only multisig actions that move funds are paused. Halt is
+		// flipped via SetHalted() from in-process or VSC_GATEWAY_HALT=1 at
+		// startup — see halt.go.
+		if IsHalted() {
+			log.Warn("gateway witnessing halted (review6 M7) — skipping rotation/actions/sync this tick", "bh", bh)
+			return
+		}
 		if bh%ROTATION_INTERVAL == 0 {
 			fmt.Println("Multisig: Running key rotation")
 			go ms.TickKeyRotation(bh)
@@ -593,10 +603,13 @@ func (ms *MultiSig) executeActions(bh uint64) (signingPackage, error) {
 		}
 	}
 
+	// review6 L5: cmp.Compare avoids the int(a)-int(b) overflow-fragile
+	// subtraction. Safe at HBD scales today, but the subtraction would wrap
+	// on adversarial inputs once Amount approaches int64 limits.
 	slices.SortFunc(
 		unstakeOps,
 		func(a ledgerDb.ActionRecord, b ledgerDb.ActionRecord) int {
-			return int(a.Amount) - int(b.Amount)
+			return cmp.Compare(a.Amount, b.Amount)
 		},
 	)
 
@@ -857,6 +870,22 @@ func (ms *MultiSig) waitForSigs(
 	resCh := make(chan collectResult, 1)
 
 	go func() {
+		// review6 H3: belt-and-suspenders recover() at the collector
+		// goroutine root. The R==0 nil-deref crash in RecoverPublicKey is
+		// already fixed at the call site (utils.go), but this goroutine
+		// reads adversary-controlled pubsub payloads and we don't want a
+		// single future copy-paste regression to take down the node. On
+		// panic, hand back whatever signatures we collected so far.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warn("collectSigs goroutine recovered from panic", "panic", r)
+				select {
+				case resCh <- collectResult{nil, 0}:
+				default:
+				}
+			}
+		}()
+
 		signedWeight := uint64(0)
 		sigs := make([]string, 0)
 		// S1: dedup on the recovered signer pubkey, not on the raw signature

@@ -165,11 +165,16 @@ func (b *Bot) fetchMultipleTxSpendKeys(
 			if err != nil {
 				return nil, fmt.Errorf("error decoding tx spend hex for tx id %s: %w", txId, err)
 			}
-			var spend contractinterface.SigningData
-			if _, err := spend.UnmarshalMsg(decoded); err != nil {
+			// review6 M5: route through SafeUnmarshalSigningData so an
+			// adversarial 13-byte msgpack frame can't make the bot allocate
+			// ~92 GB via an attacker-controlled UnsignedSigHashes array
+			// length. The bounded preflight rejects oversized arrays before
+			// the generated UnmarshalMsg sees them.
+			spend, err := contractinterface.SafeUnmarshalSigningData(decoded)
+			if err != nil {
 				return nil, fmt.Errorf("error unmarshalling tx spend for tx id %s: %w", txId, err)
 			}
-			txSpends[txId] = &spend
+			txSpends[txId] = spend
 		}
 	}
 

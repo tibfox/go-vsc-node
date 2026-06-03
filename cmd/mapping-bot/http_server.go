@@ -55,11 +55,16 @@ func mapBotHttpServer(
 			"Set OpsApiKey in config.json (separate from SignApiKey) to re-enable these.")
 	}
 
+	// review6 M9: shared per-IP rate-limiter for the unauthenticated `/`
+	// deposit-address endpoint. /sign + /retry already require API-key auth;
+	// /health is read-only.
+	depositRateLimiter := newRateLimiterMap()
+
 	mux := http.NewServeMux()
 	mux.Handle("GET /health", healthHandler(bot))
 	mux.Handle("POST /sign", signHandler(ctx, bot))
 	mux.Handle("POST /retry", retryHandler(ctx, bot))
-	mux.Handle("/", requestHandler(ctx, bot))
+	mux.Handle("/", requestHandler(ctx, bot, depositRateLimiter))
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", bot.BotConfig.HttpPort()), mux))
 }
 
@@ -165,6 +170,7 @@ type requestBody struct {
 func requestHandler(
 	globalCtx context.Context,
 	bot *mapper.Bot,
+	limiter *rateLimiterMap,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -179,6 +185,15 @@ func requestHandler(
 		// validate incoming request + parse for vsc address
 		if r.Method != http.MethodPost {
 			writeResponse(w, http.StatusMethodNotAllowed, "only POST allowed")
+			return
+		}
+
+		// review6 M9: per-IP rate-limit BEFORE any DB / crypto / contract
+		// read. 1 req/sec sustained, 5 burst; entries GC'd after 30m idle.
+		// Rejected requests cost only a hash-table lookup.
+		if limiter != nil && !limiter.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "1")
+			writeResponse(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 

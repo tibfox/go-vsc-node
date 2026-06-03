@@ -13,8 +13,16 @@ USER app
 # Set the working directory inside the container
 WORKDIR /home/app/app
 
-# Install Wasmedge
-RUN curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- -v 0.13.4
+# review6 H7: pin install.sh to the immutable release tag and verify its
+# sha256 before piping to bash. Mirrors the main vsc-node Dockerfile (see
+# go-vsc-node/Dockerfile:16-21). The `master` URL is mutable — any future
+# compromise of the WasmEdge GitHub branch would silently pivot every
+# mapping-bot build to attacker-controlled install logic. Tagged URL +
+# checksum verification removes the supply-chain RCE class for this layer.
+RUN curl -sSfL https://raw.githubusercontent.com/WasmEdge/WasmEdge/0.13.4/utils/install.sh -o /tmp/wasmedge-install.sh && \
+    echo "89460d9ea15f097e2831c099ee8adb6975b9ffff8a919b33874a655cd54420c0  /tmp/wasmedge-install.sh" | sha256sum -c - && \
+    bash /tmp/wasmedge-install.sh -v 0.13.4 && \
+    rm -f /tmp/wasmedge-install.sh
 
 # Copy the Go module files
 COPY go.mod go.sum ./

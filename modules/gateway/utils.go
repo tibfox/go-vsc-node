@@ -33,6 +33,21 @@ func IsLowS(sigBytes []byte) bool {
 	return s.Sign() > 0 && s.Cmp(halfOrderN) <= 0
 }
 
+// hasNonZeroR reports whether the R component of a compact ECDSA signature
+// is non-zero. review6 H3: secp256k1.RecoverCompact returns a nil pubKey
+// when R==0 (it cannot construct the inverse) and the subsequent
+// `*hivego.GetPublicKeyString(pubKey)` dereference panics. Guarding R≠0
+// before RecoverCompact converts the crash into an ordinary signature
+// rejection, restoring liveness for the gateway collector goroutine that
+// processes adversarial sign-response payloads.
+func hasNonZeroR(sigBytes []byte) bool {
+	if len(sigBytes) != secpCompactSigSize {
+		return false
+	}
+	r := new(big.Int).SetBytes(sigBytes[1 : 1+32])
+	return r.Sign() > 0
+}
+
 // hivePublicKeyPrefix is the Hive base58 public-key prefix. Kept in sync with
 // hivego.PublicKeyPrefix; copied locally so the FUZZ-1 guard can length-check
 // without round-tripping through the panicking decoder.
@@ -90,10 +105,25 @@ func RecoverPublicKey(signature string, hash []byte) (string, error) {
 	if !IsLowS(sigBytes) {
 		return "", errors.New("signature has non-canonical high-S value")
 	}
+	// review6 H3: reject R==0 BEFORE RecoverCompact. dcrd's RecoverCompact
+	// returns (nil, false, err) on R==0 but several call paths (notably the
+	// gateway collector goroutine in multisig.go) historically ignored err
+	// and dereferenced pubKey, producing an unrecovered panic that crashed
+	// the node on a single adversarial pubsub message. Even with proper err
+	// handling downstream this is still defense-in-depth — any future caller
+	// that copy-pastes the recovery pattern is now safe by construction.
+	if !hasNonZeroR(sigBytes) {
+		return "", errors.New("signature has zero R value (non-recoverable)")
+	}
 	pubKey, _, err := secp256k1.RecoverCompact(sigBytes, hash)
-
 	if err != nil {
 		return "", err
+	}
+	// Belt-and-suspenders nil check: a non-error return path that still
+	// produces nil pubKey would otherwise panic on the next line. Should
+	// never trigger given the IsLowS + R≠0 guards above, but cheap to keep.
+	if pubKey == nil {
+		return "", errors.New("RecoverCompact returned nil pubkey without error")
 	}
 	return *hivego.GetPublicKeyString(pubKey), nil
 }
