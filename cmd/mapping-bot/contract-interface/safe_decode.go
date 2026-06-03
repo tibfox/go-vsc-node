@@ -60,21 +60,60 @@ func SafeUnmarshalSigningData(wire []byte) (*SigningData, error) {
 
 // preflightSigningData scans the wire payload's msgpack header for the
 // "uh" (UnsignedSigHashes) field and rejects an oversized array length
-// BEFORE UnmarshalMsg sees it. The scan is deliberately conservative — on
-// any structural mismatch we bail to UnmarshalMsg, which will return its
-// own error rather than allocating. The goal is solely to prevent the
-// known OOM path; correctness of the rest of the blob is UnmarshalMsg's
-// job.
+// BEFORE UnmarshalMsg sees it.
+//
+// review6 M5 (adversarial-review correction): the prior version only
+// triggered for the exact 2-field map header 0x82, so an attacker could
+// bypass with 0x81 / 0x83-0x8f / 0xde (map16) / 0xdf (map32) — all of
+// which msgp.ReadMapHeaderBytes happily accepts. This version handles
+// every map-header variant and rejects ANY map containing a "uh" field
+// whose array length exceeds MaxUnsignedSigHashes, regardless of how
+// many fields the map declares.
+//
+// If the wire payload doesn't begin with a map header at all, we let
+// UnmarshalMsg produce its own structural error rather than guessing —
+// the OOM path only triggers when the array-header large-length is read,
+// which only happens inside the map decode.
 func preflightSigningData(buf []byte) error {
 	if len(buf) < 1 {
 		return errors.New("SigningData: empty payload")
 	}
-	// SigningData is a 2-field map; expect 0x82.
-	if buf[0] != 0x82 {
-		return nil // not the shape we're guarding; let UnmarshalMsg complain
+
+	// Decode map header — accept fixmap (0x80-0x8f), map16 (0xde),
+	// map32 (0xdf). Anything else is not a SigningData shape we recognize;
+	// hand to UnmarshalMsg for the canonical error.
+	i := 0
+	t := buf[i]
+	var fieldsRemaining int
+	switch {
+	case t >= 0x80 && t <= 0x8f:
+		fieldsRemaining = int(t - 0x80)
+		i++
+	case t == 0xde:
+		if i+3 > len(buf) {
+			return nil
+		}
+		fieldsRemaining = int(binary.BigEndian.Uint16(buf[i+1 : i+3]))
+		i += 3
+	case t == 0xdf:
+		if i+5 > len(buf) {
+			return nil
+		}
+		nf := binary.BigEndian.Uint32(buf[i+1 : i+5])
+		// review6 M5: a map with millions of fields is itself a DoS vector
+		// (each field iteration triggers a key-read + value-skip). Cap the
+		// declared map size at a sane bound. Realistic SigningData has 2
+		// fields; we allow up to 32 for forward compat.
+		if nf > 32 {
+			return fmt.Errorf("SigningData: map field count %d exceeds preflight cap 32", nf)
+		}
+		fieldsRemaining = int(nf)
+		i += 5
+	default:
+		return nil
 	}
-	i := 1
-	for fieldsRemaining := 2; fieldsRemaining > 0 && i < len(buf); fieldsRemaining-- {
+
+	for ; fieldsRemaining > 0 && i < len(buf); fieldsRemaining-- {
 		// Each field: <key> <value>. Key is a fixstr 0xa0..0xbf (msgpack
 		// short string). We expect "tx" (0xa2 't' 'x') or "uh" (0xa2 'u' 'h').
 		if i >= len(buf) {

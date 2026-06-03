@@ -80,44 +80,26 @@ func (m *rateLimiterMap) gcLoop() {
 	}
 }
 
-// clientIP extracts the request's source IP, preferring X-Forwarded-For's
-// FIRST entry (the original client) when present, falling back to
-// RemoteAddr. We don't trust XFF for auth — only as a rate-limit key — so a
-// header-spoofing attacker can only DoS THEMSELVES by manipulating it.
+// clientIP extracts the request's source IP from the TCP-layer RemoteAddr
+// only. review6 M9 (adversarial-review correction): the prior version
+// preferred X-Forwarded-For's first entry, which is fully attacker-
+// controlled. By using the spoofed XFF as the rate-limit key, an attacker
+// rotated the key per request and bypassed the per-IP throttle entirely.
+//
+// We deliberately do NOT consult XFF here. If this bot is deployed behind
+// a trusted reverse proxy that rewrites the source IP via XFF, the proxy
+// must rewrite RemoteAddr (e.g. via http.Server's PROXY-protocol handler
+// or by replacing the listener) — not via header. Trusting XFF without
+// a trusted-proxy allowlist is the documented anti-pattern.
+//
+// If a future deployment needs XFF support, gate it behind a config-
+// supplied trusted-proxy list and only consult XFF when RemoteAddr
+// matches one of those proxies. That's the standard pattern; until then,
+// RemoteAddr is the only safe rate-limit key.
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		for _, part := range splitAndTrim(xff, ',') {
-			if part != "" {
-				return part
-			}
-		}
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-func splitAndTrim(s string, sep byte) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == sep {
-			out = append(out, trimSpace(s[start:i]))
-			start = i + 1
-		}
-	}
-	out = append(out, trimSpace(s[start:]))
-	return out
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

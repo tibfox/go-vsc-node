@@ -207,9 +207,23 @@ func (ms *MultiSig) BlockTick(bh uint64, headHeight *uint64) {
 }
 
 func (ms *MultiSig) TickKeyRotation(bh uint64) {
+	// review6 M7 (adversarial-review correction): re-check IsHalted INSIDE
+	// the goroutine. The BlockTick-level check only catches halts flipped
+	// before the goroutine was launched; an operator who flips halt
+	// mid-rotation MUST stop the in-flight broadcast. Mirrored in
+	// TickActions and TickSyncFr.
+	if IsHalted() {
+		log.Warn("TickKeyRotation aborted: gateway halted (review6 M7)", "bh", bh)
+		return
+	}
 	signPkg, err := ms.keyRotation(bh)
 
 	if err != nil {
+		return
+	}
+
+	if IsHalted() {
+		log.Warn("TickKeyRotation aborted before broadcast: gateway halted (review6 M7)", "bh", bh)
 		return
 	}
 
@@ -251,6 +265,11 @@ func (ms *MultiSig) TickKeyRotation(bh uint64) {
 	}
 
 	if weight >= uint64(threshold) {
+		// review6 M7: final pre-broadcast halt check.
+		if IsHalted() {
+			log.Warn("TickKeyRotation aborted at final broadcast: gateway halted (review6 M7)", "bh", bh)
+			return
+		}
 		rotationId, err := ms.hiveCreator.Broadcast(tx)
 
 		fmt.Println("Rotation txId", rotationId, err)
@@ -258,10 +277,22 @@ func (ms *MultiSig) TickKeyRotation(bh uint64) {
 }
 
 func (ms *MultiSig) TickActions(bh uint64) {
+	// review6 M7 (adversarial-review correction): same in-flight halt
+	// re-check as TickKeyRotation. Aborts before any p2p sign-request
+	// broadcast / Hive broadcast.
+	if IsHalted() {
+		log.Warn("TickActions aborted: gateway halted (review6 M7)", "bh", bh)
+		return
+	}
 	signPkg, err := ms.executeActions(bh)
 
 	fmt.Println("TickActions", err, signPkg)
 	if err != nil {
+		return
+	}
+
+	if IsHalted() {
+		log.Warn("TickActions aborted before broadcast: gateway halted (review6 M7)", "bh", bh)
 		return
 	}
 
@@ -306,6 +337,13 @@ func (ms *MultiSig) TickActions(bh uint64) {
 	}
 
 	if weight >= uint64(threshold) {
+		// review6 M7: final pre-broadcast halt check. Last gate before
+		// putting an L1 tx on the wire — catches halts flipped during the
+		// waitForSigs window.
+		if IsHalted() {
+			log.Warn("TickActions aborted at final broadcast: gateway halted (review6 M7)", "bh", bh)
+			return
+		}
 		rotationId, err := ms.hiveCreator.Broadcast(tx)
 
 		fmt.Println("Actions txId", rotationId, err)
@@ -313,6 +351,11 @@ func (ms *MultiSig) TickActions(bh uint64) {
 }
 
 func (ms *MultiSig) TickSyncFr(bh uint64) {
+	// review6 M7: in-flight halt check at the syncFr tick too.
+	if IsHalted() {
+		log.Warn("TickSyncFr aborted: gateway halted (review6 M7)", "bh", bh)
+		return
+	}
 
 	signPkg, err := ms.syncBalance(bh)
 
@@ -361,6 +404,11 @@ func (ms *MultiSig) TickSyncFr(bh uint64) {
 	}
 
 	if weight >= uint64(threshold) {
+		// review6 M7: final pre-broadcast halt check.
+		if IsHalted() {
+			log.Warn("TickSyncFr aborted at final broadcast: gateway halted (review6 M7)", "bh", bh)
+			return
+		}
 		rotationId, err := ms.hiveCreator.Broadcast(tx)
 
 		fmt.Println("SyncFr txId", rotationId, err)
