@@ -132,8 +132,24 @@ func (d EthDID) Verify(block blocks.Block, sig string) (bool, error) {
 		return false, fmt.Errorf("failed to decode signature: %v", err)
 	}
 
-	if sigBytes[64] != 0 && sigBytes[64] != 1 {
+	// review6 closure (N6-CRIT-2 / audit #18): explicit length guard. An
+	// EIP-712 signature MUST be 65 bytes (32 R + 32 S + 1 V). Without this
+	// check, sigBytes[64] panics with index-out-of-range on any malformed
+	// L2 tx — a remote unauthenticated DoS via the tx-pool ingestion path.
+	if len(sigBytes) != 65 {
+		return false, fmt.Errorf("invalid signature length: got %d, want 65", len(sigBytes))
+	}
+
+	// Normalize v-byte to {0,1}. Reject anything outside {0,1,27,28} —
+	// underflow on `sigBytes[64] -= 27` for v=0 would silently land at
+	// 0xE5 and trip Ecrecover with an attacker-controlled byte.
+	switch sigBytes[64] {
+	case 0, 1:
+		// already normalized
+	case 27, 28:
 		sigBytes[64] -= 27
+	default:
+		return false, fmt.Errorf("invalid signature v byte: got %d, want {0,1,27,28}", sigBytes[64])
 	}
 
 	// recover the pub key from the signature and data hash
@@ -614,19 +630,19 @@ func computeEIP712Hash(typedData apitypes.TypedData) ([]byte, error) {
 	return finalHash, nil
 }
 
-// decode CBOR back into a map[string]interface{}
+// decodeFromCBOR decodes the CBOR-encoded `data` into `out`.
+//
+// review6 closure (EH-HIGH-6 / N6-L6): pre-fix the codec.Decode return
+// value was discarded and this function always returned nil — three
+// call sites (lines 93/98/513 originally) checked for an error that
+// could never fire, so malformed CBOR silently produced zero-valued
+// structs that subsequent ecrecover paths treated as authentic. Capture
+// + propagate the error so the already-present error checks at every
+// call site actually work.
 func decodeFromCBOR(data []byte, out interface{}) error {
-	// var tempData map[string]interface{}
-	codec.NewDecoderBytes(data, &codec.CborHandle{}).Decode(out)
-	// if err := cbor.DecodeInto(data, &tempData); err != nil {
-	// 	return fmt.Errorf("failed to decode CBOR data: %v", err)
-	// }
-
-	// set the decoded data back into the output
-	//
-	// this is a bit hacky, but it seems to work
-	// reflect.ValueOf(out).Elem().Set(reflect.ValueOf(tempData))
-
+	if err := codec.NewDecoderBytes(data, &codec.CborHandle{}).Decode(out); err != nil {
+		return fmt.Errorf("decodeFromCBOR: %w", err)
+	}
 	return nil
 }
 

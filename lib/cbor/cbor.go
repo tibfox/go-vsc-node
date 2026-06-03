@@ -15,6 +15,15 @@ import (
 var typeMask byte = 0xE0
 var infoBits byte = 0x1F
 
+// MaxCborItemSize bounds any single CBOR byte-string / text-string
+// allocation. review6 closure (audit #19): the three `make([]byte, aux)`
+// sites in this file read `aux` straight off the wire, so an adversarial
+// CBOR payload with aux=0xFFFFFFFFFFFFFFFF allocates ~16 EiB before the
+// subsequent ReadFull errors. 64 MiB is well above any legitimate VSC
+// CBOR payload (largest realistic single blob is a serialized contract
+// output ≪ MiB).
+const MaxCborItemSize = 64 << 20
+
 /* type values */
 var cborUint byte = 0x00
 var cborNegint byte = 0x20
@@ -382,6 +391,9 @@ func (dec *decoder) innerDecodeC(c byte, path []string) error {
 				}
 			}
 		} else {
+			if aux > MaxCborItemSize {
+				return fmt.Errorf("cbor byte-string aux=%d exceeds MaxCborItemSize=%d (review6 audit #19)", aux, MaxCborItemSize)
+			}
 			val := make([]byte, aux)
 			_, err = io.ReadFull(dec.rin, val)
 			if err != nil {
@@ -509,6 +521,9 @@ func (dec *decoder) decodeText(cborInfo byte, aux uint64, path []string) error {
 			}
 		}
 	} else {
+		if aux > MaxCborItemSize {
+			return fmt.Errorf("cbor text aux=%d exceeds MaxCborItemSize=%d (review6 audit #19)", aux, MaxCborItemSize)
+		}
 		raw := make([]byte, aux)
 		_, err = io.ReadFull(dec.rin, raw)
 		if err != nil {
@@ -667,6 +682,9 @@ func (dec *decoder) decodeBignum(c byte) (*big.Int, error) {
 		return nil, fmt.Errorf("attempting to decode bignum but sub object is not bytes but type %x", cborType)
 	}
 
+	if aux > MaxCborItemSize {
+		return nil, fmt.Errorf("cbor bignum aux=%d exceeds MaxCborItemSize=%d (review6 audit #19)", aux, MaxCborItemSize)
+	}
 	rawbytes := make([]byte, aux)
 	_, err = io.ReadFull(dec.rin, rawbytes)
 	if err != nil {
