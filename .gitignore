@@ -22,3 +22,4 @@ logs/
 *.wasm
 data-rr2-*
 .claude/scheduled_tasks.lock
+evm-mapping-bot
