@@ -184,7 +184,7 @@ func (tp *TransactionPool) IngestTx(sTx SerializedVSCTransaction, options ...Ing
 	}
 
 	// if transaction is signed by VSC DID, then ignore RCs
-	if !hasVscDID {
+	if !hasVscDID && !rcBypassEnabled() {
 		rcsAvailable := tp.rcs.GetAvailableRCs(txShell.Headers.RequiredAuths[0], latestBlk)
 
 		//Note: RcLimit is user defined input
