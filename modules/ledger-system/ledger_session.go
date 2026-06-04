@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"vsc-node/modules/common/params"
 )
 
 type ledgerSession struct {
@@ -161,6 +163,18 @@ func (ledgerSession *ledgerSession) Withdraw(withdraw WithdrawParams) LedgerResu
 				Ok:  false,
 				Msg: "invalid destination",
 			}
+		}
+	}
+
+	// review7 C7-b (yecier): reject a withdrawal whose Hive destination is the
+	// gateway's own account. Such a withdrawal debits the user on L2 but routes
+	// the L1 funds straight back into the gateway multisig with no credit to
+	// anyone — the funds are stranded. (eth/usdc dests are addresses, never the
+	// gateway account, so this only applies to Hive-asset withdrawals.)
+	if hiveAsset && strings.TrimPrefix(dest, "hive:") == params.GATEWAY_WALLET {
+		return LedgerResult{
+			Ok:  false,
+			Msg: "invalid destination",
 		}
 	}
 
