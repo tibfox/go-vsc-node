@@ -100,9 +100,44 @@ func (state *LedgerState) SnapshotForAccount(account string, blockHeight uint64,
 	return bal
 }
 
-// Mirror state_engine.UpdateBalances (state_engine.go:1295-1380): start from the
-// BalanceDb snapshot field for the asset, then add every LedgerDb record past
-// the snapshot height.
+// isLedgerMetaRow reports whether a ledger record type is protocol meta state
+// (safety-slash burn queue / finalize cursor / restitution-claim queue) rather
+// than a spendable balance movement. These rows live on protocol-owned accounts
+// and represent queue/cursor state, never spendable HIVE on the holder's own
+// account, so they are excluded from every balance summation. Mirrors the skip
+// list in StateEngine.UpdateBalances (state_engine.go:2038-2053).
+func isLedgerMetaRow(t string) bool {
+	switch t {
+	case LedgerTypeSafetySlashHiveBurn,
+		LedgerTypeSafetySlashHiveBurnPending,
+		LedgerTypeSafetySlashHiveBurnPendingRelease,
+		LedgerTypeSafetySlashHiveBurnPendingFinalized,
+		LedgerTypeSafetySlashHiveBurnPendingCancelled,
+		LedgerTypeSafetySlashBurnFinalizeCursor,
+		LedgerTypeSafetyRestitutionClaim,
+		LedgerTypeSafetyRestitutionClaimConsumed:
+		return true
+	default:
+		return false
+	}
+}
+
+// GetBalance is the authoritative spendable-balance read used by every
+// spend-check in the ledger session (ledger_session.go:167/310/356/467 …). It
+// MUST agree, for the same (account, blockHeight, asset), with the snapshot
+// that StateEngine.UpdateBalances writes — otherwise the spend gate and the
+// finalized snapshot diverge.
+//
+// review7 CRIT-1: this previously summed a positives-only OpType whitelist per
+// asset (hbd→{unstake,deposit}, hive→{deposit,restitution}, hbd_savings→{stake}),
+// which silently dropped every outgoing debit committed after the last snapshot
+// (transfer-out, withdraw, stake-out, consensus_stake-out, unstake-out). The
+// read over-reported, and the gate `(fromBal - exclusion) < amount` let the
+// same funds be spent twice (gateway insolvency). UpdateBalances instead sums
+// EVERY record past the snapshot (empty OpType filter, state_engine.go:2011)
+// minus the safety-slash meta rows. GetBalance now does exactly the same, so the
+// two can never drift again: start from the BalanceDb snapshot field for the
+// asset, then add the net of every non-meta LedgerDb record past the snapshot.
 func (ls *LedgerState) GetBalance(account string, blockHeight uint64, asset string) int64 {
 	if !slices.Contains(assetTypes, asset) {
 		return 0
@@ -118,85 +153,33 @@ func (ls *LedgerState) GetBalance(account string, blockHeight uint64, asset stri
 		balRecord = *balRecordPtr
 		recordHeight = balRecord.BlockHeight + 1
 	}
+
+	// Empty OpType filter: sum ALL records for this asset past the snapshot,
+	// exactly like UpdateBalances — never a per-asset whitelist that can drift.
+	ledgerResults, _ := ls.LedgerDb.GetLedgerRange(
+		account,
+		recordHeight,
+		blockHeight,
+		asset,
+		ledger_db.LedgerOptions{},
+	)
+
+	balAdjust := int64(0)
+	for _, v := range *ledgerResults {
+		if isLedgerMetaRow(v.Type) {
+			continue
+		}
+		balAdjust += v.Amount
+	}
+
 	switch asset {
 	case "hbd":
-		ledgerResults, _ := ls.LedgerDb.GetLedgerRange(
-			account,
-			recordHeight,
-			blockHeight,
-			asset,
-			ledger_db.LedgerOptions{
-				OpType: []string{"unstake", "deposit"},
-			},
-		)
-
-		balAdjust := int64(0)
-
-		for _, v := range *ledgerResults {
-			balAdjust += v.Amount
-		}
-
 		return balRecord.HBD + balAdjust
 	case "hive":
-		ledgerResults, _ := ls.LedgerDb.GetLedgerRange(
-			account,
-			recordHeight,
-			blockHeight,
-			asset,
-			ledger_db.LedgerOptions{
-				OpType: []string{"deposit", LedgerTypeSafetySlashRestitution},
-			},
-		)
-
-		balAdjust := int64(0)
-
-		for _, v := range *ledgerResults {
-			balAdjust += v.Amount
-		}
-
 		return balRecord.Hive + balAdjust
 	case "hbd_savings":
-		ledgerResults, _ := ls.LedgerDb.GetLedgerRange(
-			account,
-			recordHeight,
-			blockHeight,
-			asset,
-			ledger_db.LedgerOptions{
-				OpType: []string{"stake"},
-			},
-		)
-
-		stakeBal := int64(0)
-
-		for _, v := range *ledgerResults {
-			stakeBal += v.Amount
-		}
-
-		return balRecord.HBD_SAVINGS + stakeBal
+		return balRecord.HBD_SAVINGS + balAdjust
 	case "hive_consensus":
-		// Include consensus_stake (positive), consensus_unstake (negative),
-		// safety_slash_consensus (negative — debits a slashed bond), AND
-		// safety_slash_consensus_reverse (positive — re-credits a previously
-		// slashed bond, e.g. governance reversal of an erroneous slash) so
-		// the spendable bond reflects the net of all four ledger paths.
-		ledgerResults, _ := ls.LedgerDb.GetLedgerRange(
-			account,
-			recordHeight,
-			blockHeight,
-			asset,
-			ledger_db.LedgerOptions{
-				OpType: []string{
-					"consensus_stake",
-					"consensus_unstake",
-					LedgerTypeSafetySlashConsensus,
-					LedgerTypeSafetySlashConsensusReverse,
-				},
-			},
-		)
-		balAdjust := int64(0)
-		for _, v := range *ledgerResults {
-			balAdjust += v.Amount
-		}
 		return balRecord.HIVE_CONSENSUS + balAdjust
 	default:
 		return 0
