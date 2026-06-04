@@ -509,19 +509,19 @@ func (se *StateEngine) ProcessBlock(block hive_blocks.HiveBlock) {
 				json.Unmarshal(bbytes, &rawJson)
 
 				if slices.Contains(rawJson.Services, "vsc.network") {
-					// Fix 5 (verify+warn rollout): check the consensus BLS key's
-					// proof-of-possession. A valid PoP proves the announcer holds
-					// the secret behind the announced BLS pubkey, defeating
-					// rogue-key aggregate-signature forgery. For now we only log
-					// failures and still store the key, so witnesses that
-					// announced before PoP support are not dropped before they
-					// re-announce. A later change flips this to rejection (and
-					// election exclusion) once all witnesses carry a valid PoP.
-					// The check is deterministic, so that future strict mode is
-					// consensus-safe.
-					if err := verifyAnnouncedBlsPoP(rawJson, acct); err != nil {
-						log.Warn("witness announce: BLS proof-of-possession check failed (accepting during rollout)",
-							"account", acct, "txId", tx.TransactionID, "err", err)
+					// review7 C9 (strict mode): reject a witness announce whose
+					// consensus BLS key fails proof-of-possession, rather than
+					// the earlier verify+warn rollout that stored the key anyway.
+					// A valid PoP proves the announcer holds the secret behind
+					// the announced BLS pubkey; without it the key is a rogue-key
+					// aggregate-forgery vector. The check is deterministic, so
+					// rejecting is consensus-safe. An announce with no consensus
+					// BLS key is still accepted (it carries no forgeable key — the
+					// witness simply cannot sign).
+					if witnessAnnounceHasRogueBlsKey(rawJson, acct) {
+						log.Warn("witness announce REJECTED: consensus BLS key failed proof-of-possession (rogue-key guard)",
+							"account", acct, "txId", tx.TransactionID)
+						continue
 					}
 					inputData := witnesses.SetWitnessUpdateType{
 						Account:  acct,
@@ -1458,13 +1458,38 @@ func (se *StateEngine) ProcessBlock(block hive_blocks.HiveBlock) {
 // account. Returns an error if the consensus key is missing/malformed or the
 // PoP is absent or invalid. Pure function of the announce payload, so every
 // node reaches the same verdict.
+// errNoConsensusBlsKey distinguishes "announce carries no consensus BLS key"
+// (harmless — the witness simply cannot sign) from "announce carries a
+// consensus BLS key whose proof-of-possession does not verify" (a rogue-key
+// aggregate-forgery vector that must be rejected). See witnessAnnounceHasRogueBlsKey.
+var errNoConsensusBlsKey = errors.New("no consensus BLS key in announce")
+
 func verifyAnnouncedBlsPoP(meta witnesses.PostingJsonMetadata, account string) error {
 	for _, k := range meta.DidKeys {
 		if k.CryptoType == "DID-BLS" && k.Type == "consensus" {
 			return dids.VerifyBlsPoP(dids.BlsDID(k.Key), account, k.PoP)
 		}
 	}
-	return fmt.Errorf("no consensus BLS key in announce")
+	return errNoConsensusBlsKey
+}
+
+// witnessAnnounceHasRogueBlsKey reports whether a witness announce carries a
+// consensus BLS key whose proof-of-possession fails verification.
+//
+// review7 C9: such a key must NOT be stored. A BLS key accepted without a valid
+// PoP enables rogue-key aggregate-signature forgery — at consensus time only
+// the aggregate signature is available, so possession must be proven once, here,
+// at registration. The check is a pure function of the announce + account, so
+// every node reaches the same verdict and rejecting is consensus-safe. An
+// announce with no consensus BLS key at all carries no forgeable key and is
+// allowed (the witness just cannot sign).
+//
+// Operational note: this enforces the PoP cutover the earlier verify+warn
+// rollout anticipated — every witness must (re-)announce a consensus BLS key
+// with a valid PoP, or it is dropped from the witness set on its next announce.
+func witnessAnnounceHasRogueBlsKey(meta witnesses.PostingJsonMetadata, account string) bool {
+	err := verifyAnnouncedBlsPoP(meta, account)
+	return err != nil && !errors.Is(err, errNoConsensusBlsKey)
 }
 
 // isUnsupportedGatewaySavingsDeposit reports whether an L1 op is a
