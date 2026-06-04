@@ -357,6 +357,38 @@ func (ms *MultiSig) TickSyncFr(bh uint64) {
 	}
 }
 
+// gatewayMultisigMaxKeys caps the gateway multisig committee size.
+const gatewayMultisigMaxKeys = 40
+
+// selectTopWeightGatewayKeys orders the candidate gateway keys by stake weight
+// and returns at most `max` of them, breaking ties deterministically by key
+// string so every node selects the identical committee.
+//
+// review7 GV-H2: the multisig must be backed by the HIGHEST-staked witnesses
+// (the most expensive set to capture). The prior code sorted ascending and took
+// the first 40, selecting the 40 LOWEST-stake keys — the cheapest possible set
+// for an attacker to acquire and control the BTC/HBD gateway.
+func selectTopWeightGatewayKeys(gatewayKeys [][2]interface{}, weightMap map[string]uint64, max int) [][2]interface{} {
+	slices.SortFunc(gatewayKeys, func(a, b [2]interface{}) int {
+		aKey := a[0].(string)
+		bKey := b[0].(string)
+		// review2 MEDIUM #57: compare the uint64 weights directly to avoid
+		// int() truncation/overflow for very large weights/gaps.
+		// review7 GV-H2: DESCENDING — highest stake first — so the [:max]
+		// cut keeps the most-staked (most expensive to capture) witnesses.
+		if c := cmp.Compare(weightMap[bKey], weightMap[aKey]); c != 0 {
+			return c
+		}
+		// Deterministic tie-break so the committee is identical across nodes.
+		return cmp.Compare(aKey, bKey)
+	})
+
+	if len(gatewayKeys) > max {
+		gatewayKeys = gatewayKeys[:max]
+	}
+	return gatewayKeys
+}
+
 func (ms *MultiSig) keyRotation(bh uint64) (signingPackage, error) {
 	if bh%ACTION_INTERVAL != 0 {
 		return signingPackage{}, errors.New("invalid slot")
@@ -395,23 +427,7 @@ func (ms *MultiSig) keyRotation(bh uint64) (signingPackage, error) {
 		weightMap[witnessData.GatewayKey] = electionResult.Weights[idx]
 	}
 
-	slices.SortFunc(gatewayKeys, func(a, b [2]interface{}) int {
-		aKey := a[0].(string)
-		bKey := b[0].(string)
-		// review2 MEDIUM #57: int(uint64) truncates for weights >= 2^63
-		// and int(a)-int(b) overflows for large gaps, producing a wrong
-		// (or non-transitive) gateway-key order. Compare the uint64
-		// weights directly.
-		return cmp.Compare(weightMap[aKey], weightMap[bKey])
-	})
-
-	cutOff := 0
-	if len(gatewayKeys) > 40 {
-		cutOff = 40
-	} else {
-		cutOff = len(gatewayKeys)
-	}
-	gatewayKeys = gatewayKeys[:cutOff]
+	gatewayKeys = selectTopWeightGatewayKeys(gatewayKeys, weightMap, gatewayMultisigMaxKeys)
 
 	if len(gatewayKeys) < 8 {
 		return signingPackage{}, errors.New("not enough keys")

@@ -126,8 +126,13 @@ func TestReview2KeyRotationWeightSort(t *testing.T) {
 	if si < 0 || bi < 0 {
 		t.Fatalf("review2 #57: keys missing from rotation auths: s1=%d b1=%d (auths=%v)", si, bi, fake.keyAuths)
 	}
-	if si > bi {
-		t.Fatalf("review2 #57: small-weight key s1 (1) sorted AFTER near-max-weight key b1 (2^64-4): "+
-			"s1@%d b1@%d — uint64→int truncation ranked the highest weight lowest", si, bi)
+	// review7 GV-H2: keyRotation now selects HIGHEST-stake keys first
+	// (descending), so the near-max-weight key b1 (2^64-4) must rank ABOVE the
+	// small-weight key s1 (1). review2 #57: this also proves the weights are
+	// compared as uint64 — had the comparison truncated to int, b1 would become
+	// -4 and rank LOWEST (after s1), which this catches.
+	if bi > si {
+		t.Fatalf("review7 GV-H2 / review2 #57: near-max-weight key b1 (2^64-4) sorted AFTER "+
+			"small-weight key s1 (1): b1@%d s1@%d — wrong direction or uint64→int truncation", bi, si)
 	}
 }
