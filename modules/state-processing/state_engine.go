@@ -450,25 +450,32 @@ func (se *StateEngine) ProcessBlock(block hive_blocks.HiveBlock) {
 
 					fmt.Println("frSync", frSync)
 
-					var amt int64
-
-					if frSync.StakedAmount > 0 {
-						amt = frSync.StakedAmount
+					amt, ok := frSyncLedgerAmount(frSync.StakedAmount, frSync.UnstakedAmount)
+					if !ok {
+						// GV-H9/C10-a: a malformed/malicious fr_sync with a
+						// negative amount is rejected, not applied — see
+						// frSyncLedgerAmount. Skip the ledger write entirely.
+						log.Warn("fr_sync: rejecting op with negative amount(s)",
+							"txId", tx.TransactionID, "stake_amt", frSync.StakedAmount, "unstake_amt", frSync.UnstakedAmount)
 					} else {
-						//Must be negative to indicate unstaking has occurred
-						amt = -frSync.UnstakedAmount
-					}
-
-					if err := se.LedgerState.LedgerDb.StoreLedger(ledgerDb.LedgerRecord{
-						Id:          MakeTxId(tx.TransactionID, 0),
-						Amount:      amt,
-						BlockHeight: blockInfo.BlockHeight + 1,
-						Owner:       params.FR_VIRTUAL_ACCOUNT,
-						//Fractional reserve update
-						Asset: "hbd_savings",
-						Type:  "fr_sync",
-					}); err != nil {
-						log.Error("fr_sync: ledger write failed", "txId", tx.TransactionID, "amount", amt, "err", err)
+						// C10-c: fail-stop the FR ledger write. The FR virtual
+						// account's hbd_savings is path-dependent consensus state
+						// (it feeds HBD-interest distribution); a swallowed write
+						// error here drifts this node from peers permanently. The
+						// record Id is deterministic (MakeTxId(tx,0)) so the retry
+						// is idempotent. Mirrors the UpdateBalances fail-stop.
+						frRec := ledgerDb.LedgerRecord{
+							Id:          MakeTxId(tx.TransactionID, 0),
+							Amount:      amt,
+							BlockHeight: blockInfo.BlockHeight + 1,
+							Owner:       params.FR_VIRTUAL_ACCOUNT,
+							//Fractional reserve update
+							Asset: "hbd_savings",
+							Type:  "fr_sync",
+						}
+						blockingRetry(fmt.Sprintf("fr_sync StoreLedger(%s)", tx.TransactionID), func() error {
+							return se.LedgerState.LedgerDb.StoreLedger(frRec)
+						})
 					}
 				}
 
@@ -2121,6 +2128,29 @@ func (se *StateEngine) UpdateBalances(startBlock, endBlock uint64) {
 //
 // (Operator visibility is via logs for now; a health-endpoint surface for
 // the stalled state is deferred to the in-flight health PR.)
+// frSyncLedgerAmount converts an L1 vsc.fr_sync report into the signed
+// hbd_savings delta applied to the fractional-reserve virtual account. A stake
+// credits the reserve (+), an unstake debits it (-). stake_amt and unstake_amt
+// are magnitudes reported by the gateway and MUST be non-negative; a negative
+// field is malformed/malicious and is rejected (ok=false).
+//
+// review7 GV-H9 / C10-a: the prior inline form `amt = -frSync.UnstakedAmount`
+// silently flipped a negative unstake_amt into a phantom POSITIVE credit
+// (e.g. {stake_amt:0, unstake_amt:-1000} -> +1000), inflating the FR balance
+// with no L1 backing.
+func frSyncLedgerAmount(stakedAmount, unstakedAmount int64) (amt int64, ok bool) {
+	if stakedAmount < 0 || unstakedAmount < 0 {
+		// Negative magnitude is never valid; reject rather than sign-flip it
+		// into a phantom credit/debit.
+		return 0, false
+	}
+	if stakedAmount > 0 {
+		return stakedAmount, true
+	}
+	//Zero stake -> this is an unstake report; debit the reserve.
+	return -unstakedAmount, true
+}
+
 func blockingRetry(what string, read func() error) {
 	const (
 		baseDelay = 100 * time.Millisecond
