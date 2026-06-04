@@ -1,9 +1,44 @@
 package ledgerSystem
 
 import (
+	"fmt"
 	"slices"
+	"time"
 	ledger_db "vsc-node/modules/db/vsc/ledger"
 )
+
+// blockingLedgerRead runs read() until it returns nil, with capped exponential
+// backoff. Fail-stop primitive for the ledger-system spend-check path: a
+// balance read that one node completes but another swallows lets the two nodes
+// decide a tx outcome differently — a consensus fork — and the nil slice
+// pointer GetLedgerRange returns on a Mongo error panics the node if
+// dereferenced. Blocking until the DB recovers keeps every honest node either
+// computing the identical balance or making no progress, never crashing and
+// never forking. Mirrors state-processing.blockingRetry (state_engine.go:2124).
+func blockingLedgerRead(what string, read func() error) {
+	const (
+		baseDelay = 100 * time.Millisecond
+		maxDelay  = 30 * time.Second
+	)
+	delay := baseDelay
+	for attempt := 1; ; attempt++ {
+		if err := read(); err == nil {
+			if attempt > 1 {
+				log.Error("ledger DB read recovered; resuming", "op", what, "attempts", attempt)
+			}
+			return
+		} else {
+			log.Error("ledger DB read failed; blocking until DB recovers (fail-stop)",
+				"op", what, "attempt", attempt, "retryIn", delay.String(), "err", err)
+		}
+		time.Sleep(delay)
+		if delay < maxDelay {
+			if delay *= 2; delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+	}
+}
 
 // Used to represent the global ledger state in the execution environment
 type LedgerState struct {
@@ -143,26 +178,47 @@ func (ls *LedgerState) GetBalance(account string, blockHeight uint64, asset stri
 		return 0
 	}
 
-	balRecordPtr, _ := ls.BalanceDb.GetBalanceRecord(account, blockHeight)
-
 	var recordHeight uint64
 	var balRecord ledger_db.BalanceRecord
-	if balRecordPtr == nil {
-		recordHeight = 0
-	} else {
-		balRecord = *balRecordPtr
-		recordHeight = balRecord.BlockHeight + 1
-	}
+	var ledgerResults *[]ledger_db.LedgerRecord
 
-	// Empty OpType filter: sum ALL records for this asset past the snapshot,
-	// exactly like UpdateBalances — never a per-asset whitelist that can drift.
-	ledgerResults, _ := ls.LedgerDb.GetLedgerRange(
-		account,
-		recordHeight,
-		blockHeight,
-		asset,
-		ledger_db.LedgerOptions{},
-	)
+	// GV-H1 (review7): both DB reads fail-stop. The prior code discarded the
+	// GetLedgerRange error and dereferenced the nil slice pointer it returns on
+	// a Mongo fault, panicking the node mid-spend-check; and silently treating
+	// the error as "no records" would compute a balance from a partial read and
+	// fork this node from healthy peers. Block until both reads succeed so the
+	// balance is either correct or never returned. Empty OpType filter: sum ALL
+	// records for this asset past the snapshot, exactly like UpdateBalances —
+	// never a per-asset whitelist that can drift.
+	blockingLedgerRead(fmt.Sprintf("GetBalance(%s @%d %s)", account, blockHeight, asset), func() error {
+		balRecordPtr, err := ls.BalanceDb.GetBalanceRecord(account, blockHeight)
+		if err != nil {
+			return err
+		}
+		if balRecordPtr == nil {
+			recordHeight = 0
+			balRecord = ledger_db.BalanceRecord{}
+		} else {
+			balRecord = *balRecordPtr
+			recordHeight = balRecord.BlockHeight + 1
+		}
+
+		results, err := ls.LedgerDb.GetLedgerRange(
+			account,
+			recordHeight,
+			blockHeight,
+			asset,
+			ledger_db.LedgerOptions{},
+		)
+		if err != nil {
+			return err
+		}
+		if results == nil {
+			return fmt.Errorf("GetLedgerRange returned a nil result without an error")
+		}
+		ledgerResults = results
+		return nil
+	})
 
 	balAdjust := int64(0)
 	for _, v := range *ledgerResults {
