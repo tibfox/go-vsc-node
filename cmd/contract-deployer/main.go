@@ -148,7 +148,11 @@ func deployNewContract(
 	fmt.Println(string(j))
 
 	currency := "HBD"
-	if sysConfig.OnTestnet() {
+	if sysConfig.OnTestnet() || sysConfig.OnDevnet() {
+		// The devnet runs a Hive *testnet* HAF chain, whose backing asset symbol
+		// is TBD (see tests/devnet hiveAssetSymbol). Without this, the deploy fee
+		// transfer is "10.000 HBD" and Hive rejects the tx with "Cannot parse
+		// asset symbol", so contract deployment never lands on devnet.
 		currency = "TBD"
 	}
 
@@ -204,7 +208,11 @@ func updateContract(
 	fmt.Println(string(j))
 
 	currency := "HBD"
-	if sysConfig.OnTestnet() {
+	if sysConfig.OnTestnet() || sysConfig.OnDevnet() {
+		// The devnet runs a Hive *testnet* HAF chain, whose backing asset symbol
+		// is TBD (see tests/devnet hiveAssetSymbol). Without this, the deploy fee
+		// transfer is "10.000 HBD" and Hive rejects the tx with "Cannot parse
+		// asset symbol", so contract deployment never lands on devnet.
 		currency = "TBD"
 	}
 
