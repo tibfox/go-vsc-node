@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"testing"
 	"vsc-node/lib/utils"
+	"vsc-node/lib/vsclog"
 
 	"github.com/JustinKnueppel/go-result"
 	"github.com/chebyrash/promise"
@@ -74,10 +75,17 @@ func projectRoot() result.Result[string] {
 	return result.Ok(wd)
 }
 
+// log carries the module name so a best-effort permission warning is
+// attributable in node logs.
+var log = vsclog.Module("config")
+
 // stripWorld removes any o+rwx bits from path while preserving owner and
 // group bits, so operators who have widened group access for shared editing
 // don't have their setup clobbered on every config write.
-func stripWorld(p string) error {
+//
+// Declared as a var so tests can simulate a chmod failure (e.g. EPERM on a
+// config file the node does not own).
+var stripWorld = func(p string) error {
 	fi, err := os.Stat(p)
 	if err != nil {
 		return err
@@ -87,6 +95,19 @@ func stripWorld(p string) error {
 		return nil
 	}
 	return os.Chmod(p, cur&^0o007)
+}
+
+// stripWorldBestEffort tightens perms on an existing config path but never
+// fails over it. The GV-H7 world-bit strip is a best-effort migration: a node
+// must still boot when it cannot chmod a config file it does not own (e.g. a
+// root-owned p2pConfig.json on a bind-mounted deployment, which otherwise
+// crash-loops on "operation not permitted"). The bits are stripped when
+// possible; otherwise the operator is warned to harden the perms manually.
+func (c *Config[T]) stripWorldBestEffort(p string) {
+	if err := stripWorld(p); err != nil {
+		log.Warn("GV-H7: could not strip world bits from config path; continuing (harden perms manually)",
+			"path", p, "err", err)
+	}
 }
 
 func (c *Config[T]) FilePath() string {
@@ -127,12 +148,8 @@ func (c *Config[T]) Init() error {
 		// world-readable. Group bits are preserved so operators can still grant
 		// shared-group access deliberately.
 		dir := path.Dir(c.FilePath())
-		if err = stripWorld(dir); err != nil {
-			return err
-		}
-		if err = stripWorld(c.FilePath()); err != nil {
-			return err
-		}
+		c.stripWorldBestEffort(dir)
+		c.stripWorldBestEffort(c.FilePath())
 	}
 	c.loaded = true
 	return nil
@@ -174,12 +191,8 @@ func (c *Config[T]) Update(updater func(*T)) error {
 	// dir/file, so explicitly strip world bits to migrate nodes whose config
 	// was created world-readable by an earlier build. Group bits are left
 	// alone so operators can grant shared-group access manually.
-	if err = stripWorld(dir); err != nil {
-		return err
-	}
-	if err = stripWorld(c.FilePath()); err != nil {
-		return err
-	}
+	c.stripWorldBestEffort(dir)
+	c.stripWorldBestEffort(c.FilePath())
 	c.value = temp
 	return nil
 }
