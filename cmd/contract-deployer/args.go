@@ -50,8 +50,13 @@ func ParseArgs() (args, error) {
 	isInit := flag.Bool("init", false, "Generate credentials config files")
 	gqlUrl := flag.String(
 		"gqlUrl",
-		"https://api.vsc.eco/api/v1/graphql",
-		"GraphQL API URL for fetching latest election",
+		"",
+		"GraphQL API URL of a Magi node, used to fetch the latest election (the "+
+			"committee's BLS member keys) before requesting a storage proof. Required "+
+			"when -wasmPath is given. Mainnet examples: "+
+			"https://vsc.techcoderx.com/api/v1/graphql, "+
+			"https://magi.milohpr.com/api/v1/graphql. Testnet example: "+
+			"https://magi-test.techcoderx.com/api/v1/graphql",
 	)
 	dataDir := flag.String("data-dir", "data", "Data directory for config")
 	contractId := flag.String(
@@ -144,6 +149,29 @@ func ParseArgs() (args, error) {
 	}
 	if parsed.ledgerSignCmd != "" && parsed.noBroadcast {
 		return parsed, fmt.Errorf("-ledger-sign-cmd cannot be combined with -no-broadcast")
+	}
+
+	// -gqlUrl has no default on purpose. It used to default to
+	// https://api.vsc.eco/api/v1/graphql, dead since 2026-09-17 (dial tcp
+	// 149.56.25.168:443: i/o timeout) — the same dead host B17 removed as the
+	// evm-mapping-bot's GRAPHQL_URLS default. Because the only consumer here is
+	// client.RequestProof -> FetchElection, every deploy that relied on the
+	// default failed late, at the storage-proof step, with a confusing network
+	// error after the whole P2P stack had already spun up. Demanding the flag
+	// fails immediately instead, with a message naming live endpoints.
+	//
+	// It is only needed when a storage proof is actually requested: -init,
+	// -cancel-update and -broadcast-signed all return before that, so they must
+	// keep working without it.
+	if parsed.wasmPath != "" && parsed.broadcastSigned == "" && !parsed.cancelUpdate &&
+		parsed.gqlUrl == "" {
+		return parsed, fmt.Errorf(
+			"-gqlUrl is required when deploying or updating a contract with -wasmPath: " +
+				"it is how the deployer fetches the current election to build the storage " +
+				"proof. Pass a live Magi node, e.g. " +
+				"-gqlUrl https://vsc.techcoderx.com/api/v1/graphql (mainnet) or " +
+				"-gqlUrl https://magi-test.techcoderx.com/api/v1/graphql (testnet)",
+		)
 	}
 
 	return parsed, nil
