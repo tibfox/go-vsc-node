@@ -183,9 +183,24 @@ import (
 //     the whole storage operation that took it past its rc_limit. A new line
 //     because mainnet runs 0.14.0. Inert until 0.15.0 is chain-active, so
 //     settled history re-executes at the price it was charged.
+//   - 0.17.0 (consensusversion.V0_17_0): DEPOSIT-REFUND-1. A Hive transaction
+//     that deposits to the gateway and whose Magi operations fail sends the
+//     deposit back to the sender's Hive account.
+//   - 0.18.0 (consensusversion.V0_18_0): RC-TREADMILL-1. An account is charged
+//     only RC it actually has, and a slot that charged it nothing leaves its RC
+//     record alone. Every failure path charges a flat RC without asking whether
+//     the payer can pay it, and the clamp that stops the stored total exceeding
+//     the payer's ceiling re-stamps the record at the closing slot, which
+//     re-anchors the return schedule for the whole frozen total. A Hive account
+//     with no HBD has only the 10,000 free allowance, returning at 0.069 RC a
+//     block — under a re-anchor less than 15 blocks later the truncating divide
+//     returns nothing at all, so the account's RC never came back while it kept
+//     retrying. A new line rather than an addition to 0.15.0 (the batch mainnet
+//     raises its floor to next) or 0.17.0 (an unrelated rule). Inert until
+//     0.18.0 is chain-active, so settled history re-executes to the RC it froze.
 const (
 	currentMajor        uint64 = 0
-	currentConsensus    uint64 = 15
+	currentConsensus    uint64 = 18
 	currentNonConsensus uint64 = 0
 )
 

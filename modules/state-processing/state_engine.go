@@ -2749,7 +2749,11 @@ func (se *StateEngine) ExecuteBatch() {
 		// every node from the content-addressed resolve error.
 		if tx.Invalid {
 			if tx.Payer != "" {
-				se.RcMap[tx.Payer] += 50
+				// An invalid tx has no block height of its own (it never
+				// resolved into ops), so the 0.18.0 gate resolves at the
+				// closing slot's height — the same height UpdateRcMap folds
+				// this charge in at, and one every node agrees on.
+				se.ChargeRc(se.RcSystem.NewSession(ledgerSession), tx.Payer, se.slotStatus.SlotHeight, 50)
 			}
 			se.TxOutput[tx.TxId] = TxOutput{Ok: false}
 			se.TxOutIds = append(se.TxOutIds, tx.TxId)
@@ -2853,8 +2857,9 @@ func (se *StateEngine) ExecuteBatch() {
 				result.RcUsed,
 			)
 
-			rcUsed := se.RcMap[payer] // don't crash if payer is not in RC map
-			se.RcMap[payer] = rcUsed + result.RcUsed
+			// ChargeRc tolerates a payer that is not in the RC map yet, and
+			// from 0.18.0 charges only RC the payer has (RC-TREADMILL-1).
+			se.ChargeRc(rcSession, payer, vscTx.TxSelf().BlockHeight, result.RcUsed)
 
 			if vscTx.Type() == "call" {
 				txId := MakeTxId(tx.TxId, idx)
@@ -3544,7 +3549,18 @@ func (se *StateEngine) UpdateRcMap(blockHeight uint64) {
 	stopUpdateRcMap := se.profiler.Start(PhaseUpdateRcMap)
 	defer stopUpdateRcMap()
 	records := make([]rcDb.RcRecord, 0, len(se.RcMap))
+	// 0.18.0 (RC-TREADMILL-1): a slot that charged an account nothing does not
+	// touch its RC record. Re-stamping the record here re-anchors the return
+	// schedule for the account's whole frozen total, and for a total small
+	// enough that CalculateFrozenBal's (total * elapsed / RC_RETURN_PERIOD)
+	// truncates to zero, that throws away every RC it would have regained.
+	// From 0.18.0 ChargeRc no longer records an uncharged payer, so this is
+	// also the belt on any other path that leaves a zero in the map.
+	skipUncharged := consensusversion.UnaffordableRcNotChargedActive(se.ActiveConsensusVersion(blockHeight))
 	for k, v := range se.RcMap {
+		if skipUncharged && v == 0 {
+			continue
+		}
 		rcAccountStart := time.Now()
 		//Get the last rc record
 		rcRecord, _ := se.rcDb.GetRecord(k, blockHeight-1)

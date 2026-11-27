@@ -162,3 +162,26 @@ func TestSettlementAttestationQuorumActiveOnlyAtOrAboveTheLine(t *testing.T) {
 		}
 	}
 }
+
+// Below 0.18.0 the flat failure charge is applied whatever the payer holds, so
+// a node replaying settled history freezes the RC the chain froze; at and above
+// it, a payer that cannot cover a charge is not charged and its RC record is
+// left alone (RC-TREADMILL-1).
+func TestUnaffordableRcNotChargedActiveOnlyAtOrAboveTheLine(t *testing.T) {
+	for _, tc := range []struct {
+		active Version
+		want   bool
+	}{
+		{Version{}, false},                        // no election stored yet (fresh genesis)
+		{Version{Major: 0, Consensus: 14}, false}, // the line mainnet is on today
+		{Version{Major: 0, Consensus: 15}, false}, // the storage write price
+		{Version{Major: 0, Consensus: 17}, false}, // DEPOSIT-REFUND-1
+		{Version{Major: 0, Consensus: 18}, true},
+		{Version{Major: 0, Consensus: 19}, true},
+		{Version{Major: 1, Consensus: 18}, true},
+	} {
+		if got := UnaffordableRcNotChargedActive(tc.active); got != tc.want {
+			t.Errorf("UnaffordableRcNotChargedActive(%s) = %v, want %v", tc.active.Format(), got, tc.want)
+		}
+	}
+}

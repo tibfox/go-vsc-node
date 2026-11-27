@@ -8,6 +8,7 @@ import (
 	ledgerDb "vsc-node/modules/db/vsc/ledger"
 	rcDb "vsc-node/modules/db/vsc/rcs"
 	"vsc-node/modules/gql/model"
+	rc_system "vsc-node/modules/rc-system"
 
 	"go.mongodb.org/mongo-driver/mongo"
 )
@@ -132,5 +133,49 @@ func TestGetAccountRc_NilRecordNoErrorDoesNotPanic(t *testing.T) {
 	}
 	if got.Amount != 0 || got.MaxRcs != 0 {
 		t.Errorf("did fresh account (nil,nil record): amount %d max %d, want 0/0 (NC-4)", got.Amount, got.MaxRcs)
+	}
+}
+
+// RC-GQL-2: a Hive account that has never held HBD has no balance record, and
+// its whole RC budget is the free allowance. The resolver used to return that
+// allowance in full from an early branch that never read the RC record, so the
+// one account whose RC is most likely to be spent was always shown as having
+// all of it — and a user waiting for the 5-day return saw nothing move.
+func TestGetAccountRc_NeverFundedAccountSubtractsWhatIsFrozen(t *testing.T) {
+	const hive = "hive:never-funded"
+	free := params.RC_HIVE_FREE_AMOUNT
+	r := &queryResolver{&Resolver{
+		Balances: nilNilBalances{}, // no balance record, ever
+		Rc: fakeRcs{recs: map[string]rcDb.RcRecord{
+			// the whole allowance frozen, anchored at height 1
+			hive: {Account: hive, Amount: free, BlockHeight: 1},
+		}},
+	}}
+
+	// At the anchor: nothing available, all of it frozen.
+	h := model.Uint64(1)
+	got, err := r.GetAccountRc(context.Background(), hive, &h)
+	if err != nil {
+		t.Fatalf("at the anchor: %v", err)
+	}
+	if got.Amount != 0 || got.MaxRcs != free {
+		t.Errorf("at the anchor: amount %d max %d, want 0/%d — the free allowance is spent, "+
+			"not available (RC-GQL-2)", got.Amount, got.MaxRcs, free)
+	}
+
+	// Later: what the return has given back, and no more.
+	const elapsed = 14_400 // a tenth of RC_RETURN_PERIOD
+	h = model.Uint64(1 + elapsed)
+	got, err = r.GetAccountRc(context.Background(), hive, &h)
+	if err != nil {
+		t.Fatalf("after %d blocks: %v", elapsed, err)
+	}
+	want := free - rc_system.CalculateFrozenBal(1, 1+elapsed, free)
+	if got.Amount != want {
+		t.Errorf("after %d blocks: amount %d, want %d (the return so far)", elapsed, got.Amount, want)
+	}
+	if got.Amount <= 0 || got.Amount >= free {
+		t.Errorf("after %d blocks: amount %d must be part way back, not 0 and not the full %d",
+			elapsed, got.Amount, free)
 	}
 }

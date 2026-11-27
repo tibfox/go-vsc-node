@@ -1076,3 +1076,53 @@ func Version0_17_0Active(active Version) bool {
 func FailedTxDepositRefundActive(active Version) bool {
 	return Version0_17_0Active(active)
 }
+
+// V0_18_0 is the 0.18.0 consensus line (RC-TREADMILL-1): what an account is
+// charged for a transaction it cannot pay for. Binaries announce it from the
+// release that sets version.go currentConsensus to 18; the rule on it is inert
+// until the chain floor reaches it.
+//
+// A new line rather than an addition to 0.15.0 — the other line about what a
+// call is charged — because 0.15.0 is the batch mainnet raises its floor to
+// next, and amending a line a fleet is about to activate gives the rule no
+// rollout window. Not 0.17.0 either: that line is DEPOSIT-REFUND-1, and one
+// floor rise should not activate an unrelated rule nobody tested alongside it.
+// 0.16.0 is left as the 0.17.0 batch left it, unclaimed here, in case a branch
+// in flight is holding it.
+var V0_18_0 = Version{Major: 0, Consensus: 18, NonConsensus: 0}
+
+// Version0_18_0Active reports whether the 0.18.0 line is in force given the
+// chain-active consensus version.
+func Version0_18_0Active(active Version) bool {
+	return active.MeetsConsensusMin(V0_18_0)
+}
+
+// UnaffordableRcNotChargedActive (0.18.0, RC-TREADMILL-1) reports whether an
+// account is charged only RC it actually has, and whether a slot that charged
+// it nothing leaves its RC record alone.
+//
+// Every failure path charges a flat RC — 100 for a call the engine refused, 50
+// for a transaction it could not decode — without asking whether the payer can
+// pay it. UpdateRcMap then clamps the stored frozen total to the payer's
+// ceiling (balance + the free allowance) and re-stamps it at the closing slot,
+// which re-anchors the RC_RETURN_PERIOD schedule for the whole total. For a
+// Hive account with no HBD the ceiling is the 10,000 free allowance alone, so a
+// few calls pin the total at it; from then on the account is charged RC it does
+// not have, and the re-anchor restarts its return. 10,000 RC returns at 0.069
+// RC a block, which CalculateFrozenBal's truncating divide drops to zero
+// whenever the next re-anchor lands under 15 blocks later: the account never
+// regains a single RC for as long as it keeps trying, and a retry every hour is
+// enough to hold it there for ever.
+//
+// Skipping the part of a charge the payer cannot cover costs nothing in
+// deterrence: it is the part the clamp already threw away. What changes is that
+// an account with nothing left is no longer written at all, so the return it has
+// already earned survives and its RC comes back on schedule.
+//
+// Below the line the flat charge is added verbatim, so settled history
+// re-executes to the RC it froze. Resolve `active` at the transaction's own
+// block height (the closing slot's, for a charge with no transaction height of
+// its own).
+func UnaffordableRcNotChargedActive(active Version) bool {
+	return Version0_18_0Active(active)
+}

@@ -451,17 +451,20 @@ func (r *queryResolver) GetAccountRc(ctx context.Context, account string, height
 	// fresh account), NOT mongo.ErrNoDocuments - so the old ErrNoDocuments-only guard fell
 	// through and balRecord.HBD below nil-panicked on any fresh account's RC query. Surface a
 	// real DB error, and treat an absent record (nil, with or without ErrNoDocuments) as a
-	// zero-HBD account that reports only the free allowance.
+	// zero-HBD account (RC-GQL-2 below: still minus whatever it has frozen).
 	if err != nil && err != mongo.ErrNoDocuments {
 		return nil, fmt.Errorf("failed to get balance record for %s: %w", account, err)
 	}
-	if balRecord == nil {
-		return &rcDb.RcRecord{
-			Account:     account,
-			Amount:      amount,
-			MaxRcs:      maxRcs,
-			BlockHeight: blockHeight,
-		}, nil
+	// RC-GQL-2: an account with no balance record has no HBD, which is NOT the
+	// same as having nothing frozen. The early return here reported the free
+	// allowance in full without ever reading the RC record, so a Hive account
+	// that never held HBD — the one whose whole budget is that allowance — was
+	// told it had all 10,000 RC while the engine enforced 0, and showed no sign
+	// of the return it was waiting on. Carry a zero HBD balance through the same
+	// path as any other, so the frozen total is subtracted either way.
+	var hbdBal int64
+	if balRecord != nil {
+		hbdBal = balRecord.HBD
 	}
 
 	rcRecord, err := r.Rc.GetRecord(account, blockHeight)
@@ -474,16 +477,16 @@ func (r *queryResolver) GetAccountRc(ctx context.Context, account string, height
 		// freshly funded mapping-bot DID) it had 0 RC.
 		return &rcDb.RcRecord{
 			Account:     account,
-			Amount:      amount + balRecord.HBD,
-			MaxRcs:      maxRcs + balRecord.HBD,
+			Amount:      amount + hbdBal,
+			MaxRcs:      maxRcs + hbdBal,
 			BlockHeight: blockHeight,
 		}, nil
 	}
 
 	//Add MAX RC balance from HBD
-	maxRcs = maxRcs + balRecord.HBD
+	maxRcs = maxRcs + hbdBal
 	//Add available RCs from HBD; this may be changed later
-	amount = amount + balRecord.HBD
+	amount = amount + hbdBal
 
 	//Get number of blocks that have elapsed since the last RC update
 	// review2 MEDIUM #107: overflow/negative/underflow-safe shared helper
