@@ -1,0 +1,15 @@
+# What an account that has run out of RC is charged, before and after the floor
+# reaches consensus 0.18.0 (RC-TREADMILL-1): a payer that cannot cover a charge
+# is not charged at all, and a slot that charged it nothing leaves its RC record
+# alone, so its return is no longer re-anchored out of existence.
+#
+# One test per line: the test name, then the env settings it runs with. Needs no
+# inputs — the probe contract is built from modules/wasm/e2e/go_wasm.
+#
+# The last case waits out the ~1,440 blocks the free allowance takes to return
+# the 100 RC a call costs. One block is three seconds of the test clock however
+# fast the harness mines them, so that wait is 72 minutes of budget and the run
+# needs DEVNET_BUDGET_CAP above the 75-minute default. Without it the case
+# records itself as skipped; what the rule does is covered either way by the
+# funded-payer case before it.
+TestRcTreadmill_Activation DEVNET_FASTBLOCKS=1 DEVNET_BUDGET_CAP=150m
