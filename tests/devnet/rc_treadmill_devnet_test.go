@@ -1,6 +1,6 @@
 package devnet
 
-// The three 0.18.0 rules about RC an account does not have, on a real network,
+// The four 0.18.0 rules about RC an account does not have, on a real network,
 // before and after the floor reaches consensus 0.18.0. An account whose whole
 // RC budget is the Hive free allowance spends it, then:
 //
@@ -13,6 +13,10 @@ package devnet
 //   - RC-UNGATED-OPS-1: it transfers. A transfer is charged a flat 100 RC when
 //     it is done, with nothing asking first whether the payer had it, so an
 //     account with no RC keeps transferring.
+//   - RC-CEILING-OVERHANG-1: it moves its HBD out. Its RC record was clamped at
+//     the balance it had when the slot closed, so it is left owing more than it
+//     can owe, and since the return is a fraction of the stored total, nothing
+//     comes back until that total falls under its new ceiling.
 //
 // The slot-gate and ungated-op cases credit the account a little HBD first (RC
 // is the HBD balance plus the free allowance, less what is frozen), which puts
@@ -88,11 +92,11 @@ const (
 	// exactly the two it can pay for.
 	rctWindowHbd   = "0.250"
 	rctWindowUnits = 250
-	// rctMoveHbd / rctMoveUnits is what the ungated-op cases transfer OUT of
-	// the free-tier account: small enough that the account can plainly afford
-	// it, so the only thing that can refuse the transfer is RC.
-	rctMoveHbd   = "0.050"
-	rctMoveUnits = 50
+	// rctOverhangBlocks is how far the chain is advanced to measure what an
+	// account over its ceiling gets back. Capped at its ceiling the return is
+	// ~10,000/144,000 a block, so 150 blocks is ~10 RC; uncapped, an account
+	// 250 units over needs ~3,500 blocks before it sees one.
+	rctOverhangBlocks = 150
 )
 
 func TestRcTreadmill_Activation(t *testing.T) {
@@ -298,46 +302,67 @@ func TestRcTreadmill_Activation(t *testing.T) {
 		_, ceiling := rcNow(t)
 		t.Fatalf("credited %s with %s HBD but its ceiling is %d, was %d", payer, rctWindowHbd, ceiling, ceilingBefore)
 	}
-	// restoreBalance credits the free-tier account the units moveOut moved out,
-	// so its ceiling matches the frozen total the slot stored for it and the
-	// cases that follow measure its return rather than an overhang.
-	restoreBalance := func(t *testing.T, tag string, ceilingAfterMove int64) {
+	// hbdAmount renders ledger units (milli-HBD) as the amount string a
+	// vsc.transfer payload takes.
+	hbdAmount := func(units int64) string {
+		return fmt.Sprintf("%d.%03d", units/1000, units%1000)
+	}
+	// hbdBalance is the free-tier account's HBD balance in ledger units.
+	hbdBalance := func(t *testing.T) int64 {
 		t.Helper()
-		if _, err := d.ledgerOp("vsc.transfer", d.witnessAccount(3), freeTier, rctMoveHbd, "hbd", tag+" restore"); err != nil {
-			t.Fatalf("%s: putting the %d HBD units back: %v", tag, rctMoveUnits, err)
+		rec, err := d.GetAccountBalance(ctx, rcpRefNode, payer)
+		if err != nil {
+			t.Fatalf("reading %s balance: %v", payer, err)
+		}
+		if rec == nil {
+			return 0
+		}
+		return rec.Hbd
+	}
+	// putBack credits `units` of HBD back to the free-tier account from the
+	// witness that received them, and waits for the credit to reach what a
+	// wallet reads.
+	putBack := func(t *testing.T, tag string, units int64) {
+		t.Helper()
+		if units <= 0 {
+			return
+		}
+		_, ceilingBefore := rcNow(t)
+		if _, err := d.ledgerOp("vsc.transfer", d.witnessAccount(3), freeTier, hbdAmount(units), "hbd", tag+" put back"); err != nil {
+			t.Fatalf("%s: putting %d HBD units back: %v", tag, units, err)
 		}
 		deadline := devnetNow().Add(8 * time.Minute)
 		for devnetNow().Before(deadline) {
-			if _, ceiling := rcNow(t); ceiling >= ceilingAfterMove+rctMoveUnits {
-				avail, _ := rcNow(t)
-				t.Logf("%s: put the %d HBD units back, ceiling %d, %d RC available", tag, rctMoveUnits, ceiling, avail)
+			if avail, ceiling := rcNow(t); ceiling >= ceilingBefore+units {
+				t.Logf("%s: put %d HBD units back, ceiling %d, %d RC available", tag, units, ceiling, avail)
 				return
 			}
 			devnetSleep(3 * time.Second)
 		}
 		_, ceiling := rcNow(t)
-		t.Fatalf("%s: put the %d HBD units back but the ceiling is %d, want %d — the account is left underwater "+
-			"and the cases after this one measure the overhang", tag, rctMoveUnits, ceiling, ceilingAfterMove+rctMoveUnits)
+		t.Fatalf("%s: put %d HBD units back but the ceiling is %d, want %d", tag, units, ceiling, ceilingBefore+units)
 	}
-
-	// moveOut transfers a little of the free-tier account's HBD back to a
-	// witness and returns the transaction's status and whether the money
-	// actually left. The balance is read as the RC ceiling, which is the
-	// account's HBD plus the free allowance: a transfer that ran lowers it.
+	// moveOut transfers the free-tier account's WHOLE HBD balance to a witness
+	// and reports the transaction's status, whether the money actually left,
+	// and how much it was. The balance is also read as the RC ceiling (the
+	// account's HBD plus the free allowance), which a transfer that ran lowers.
 	//
-	// Money that moved is put back from the witness that received it, because a
-	// balance that falls leaves the account UNDERWATER: the slot's clamp caps
-	// the stored frozen total at the balance the account had when the slot
-	// closed (the balance index is folded a slot behind), so a debit in that
-	// same slot drops the ceiling below the stored total and the account's
-	// available RC is pinned at 0 until the decay works off the difference — 15
-	// blocks per RC, 720 blocks for the 50 units moved here. Without the
-	// restore the cases that follow measure that overhang instead of the
-	// return, which is exactly how this first showed up.
-	moveOut := func(t *testing.T, tag string) (status string, moved bool) {
+	// All of it, because that is what puts an account over its ceiling
+	// (RC-CEILING-OVERHANG-1): the slot's clamp caps the stored frozen total at
+	// the balance the account had when the slot closed, and a moment later that
+	// balance is gone. The account is then left owing more than it can owe, and
+	// below the line the whole of that total has to decay back under the
+	// ceiling before it has a single RC — which is also what the cases that
+	// follow a move have to put back (putBack) if they are to measure a return
+	// rather than an overhang.
+	moveOut := func(t *testing.T, tag string) (status string, moved bool, units int64) {
 		t.Helper()
+		units = hbdBalance(t)
+		if units <= 0 {
+			t.Fatalf("%s: the account holds no HBD; there is nothing for a transfer to move", tag)
+		}
 		_, ceilingBefore := rcNow(t)
-		txId, err := d.ledgerOp("vsc.transfer", freeTier, d.witnessAccount(3), rctMoveHbd, "hbd", tag)
+		txId, err := d.ledgerOp("vsc.transfer", freeTier, d.witnessAccount(3), hbdAmount(units), "hbd", tag)
 		if err != nil {
 			t.Fatalf("%s: broadcasting the transfer: %v", tag, err)
 		}
@@ -345,19 +370,37 @@ func TestRcTreadmill_Activation(t *testing.T) {
 		if status == "" {
 			t.Fatalf("%s: the transfer never became final (tx %s)", tag, txId)
 		}
-		// The balance snapshot is written when the slot is folded, so give it
-		// a couple of slots before concluding nothing moved.
+		// The balance snapshot is written when the slot is folded, so give it a
+		// couple of slots before concluding nothing moved.
 		deadline := devnetNow().Add(4 * time.Minute)
 		for devnetNow().Before(deadline) {
-			if _, ceiling := rcNow(t); ceiling <= ceilingBefore-rctMoveUnits {
-				restoreBalance(t, tag, ceiling)
-				return status, true
+			if _, ceiling := rcNow(t); ceiling <= ceilingBefore-units {
+				t.Logf("%s: transfer %s, %d HBD units left the account, ceiling %d -> %d",
+					tag, status, units, ceilingBefore, ceiling)
+				return status, true, units
 			}
 			devnetSleep(3 * time.Second)
 		}
 		_, ceilingAfter := rcNow(t)
-		t.Logf("%s: transfer %s, ceiling %d -> %d", tag, status, ceilingBefore, ceilingAfter)
-		return status, false
+		t.Logf("%s: transfer %s, ceiling %d -> %d (nothing moved)", tag, status, ceilingBefore, ceilingAfter)
+		return status, false, units
+	}
+	// overhang advances the chain and reports what the account's available RC
+	// did over the span. Used on an account whose RC record sits above its
+	// ceiling, where below the line the answer is "nothing".
+	overhang := func(t *testing.T, tag string, blocks uint64) (gained int64, spanned uint64, ceiling int64) {
+		t.Helper()
+		before, ceiling := rcNow(t)
+		start := nodeBlock(t, d, ctx, rcpRefNode)
+		if err := d.WaitForBlockProcessing(ctx, rcpRefNode, start+blocks, 20*time.Minute); err != nil {
+			t.Fatalf("%s: advancing the chain: %v", tag, err)
+		}
+		head := nodeBlock(t, d, ctx, rcpRefNode)
+		after, _ := rcNow(t)
+		spanned = head - start
+		t.Logf("%s: %d -> %d RC over %d blocks (ceiling %d, records %v)",
+			tag, before, after, spanned, ceiling, records(t))
+		return after - before, spanned, ceiling
 	}
 	// slotGate is the pair of measurements the slot-aware gate changes: how
 	// many calls of one burst ran, against how many the account could pay for.
@@ -467,18 +510,40 @@ func TestRcTreadmill_Activation(t *testing.T) {
 
 	// RC-UNGATED-OPS-1, below the line: a transfer is charged a flat 100 RC
 	// when it is done and nothing asked first whether the payer had it, so an
-	// account with no RC left keeps transferring.
-	must("before/04c_a_transfer_by_an_account_with_no_rc_still_runs", func(t *testing.T) {
+	// account with no RC left keeps transferring. And then RC-CEILING-OVERHANG-1,
+	// which the transfer has just put it in: its RC record was clamped at the
+	// balance it had when the slot closed, that balance is now somewhere else,
+	// and the whole stored total has to decay back under its new ceiling before
+	// it has a single RC.
+	must("before/04c_a_transfer_with_no_rc_runs_and_leaves_the_account_owing_more_than_it_can", func(t *testing.T) {
 		if avail, _ := rcNow(t); avail >= rctCallMinRc {
 			drain(t, "before the ungated-op case")
 		}
 		avail, _ := rcNow(t)
-		status, moved := moveOut(t, "ungated transfer below the line")
+		status, moved, units := moveOut(t, "ungated transfer below the line")
 		if status != "CONFIRMED" || !moved {
 			t.Fatalf("a transfer by an account with %d RC: status %s, money moved %v; below the line it must "+
 				"still run — settled history depends on it", avail, status, moved)
 		}
-		t.Logf("with %d RC available the transfer ran anyway and moved %d HBD units", avail, rctMoveUnits)
+		t.Logf("with %d RC available the transfer ran anyway and moved %d HBD units", avail, units)
+
+		// It is now over its ceiling by what it moved, and below the line that
+		// costs it everything: the return is a fraction of the stored total, so
+		// nothing is available until the total itself falls under the ceiling —
+		// about 3,500 blocks for this overhang, and close to the full five-day
+		// period for an account that had spent a real balance's worth of RC.
+		gained, spanned, ceiling := overhang(t, "overhang below the line", rctOverhangBlocks)
+		if gained != 0 {
+			t.Fatalf("below the line the account regained %d RC over %d blocks while owing more than its %d "+
+				"ceiling; it must regain nothing — settled history depends on it", gained, spanned, ceiling)
+		}
+		t.Logf("below the line: nothing came back over %d blocks (capped at its %d ceiling it would have "+
+			"been about %d RC)", spanned, ceiling, ceiling*int64(spanned)/144_000)
+
+		// Put it back, so the cases after this one measure a return and not
+		// this overhang. Without it they read zero and look like a regression,
+		// which is how this was found.
+		putBack(t, "below the line", units)
 	})
 
 	// ------------------------------------------------------------------
@@ -591,7 +656,7 @@ func TestRcTreadmill_Activation(t *testing.T) {
 		if avail >= rctCallMinRc {
 			t.Fatalf("%d RC available: the previous case must leave the account unable to pay", avail)
 		}
-		status, moved := moveOut(t, "ungated transfer after the line")
+		status, moved, _ := moveOut(t, "ungated transfer after the line")
 		if status != "FAILED" || moved {
 			t.Fatalf("a transfer by an account with %d RC: status %s, money moved %v; from 0.18.0 an operation "+
 				"whose payer cannot pay for it must not run — RC is the only thing rationing it",
@@ -665,5 +730,46 @@ func TestRcTreadmill_Activation(t *testing.T) {
 
 	t.Run("after/09_every_node_holds_the_same_rc_records", func(t *testing.T) {
 		rcpNodesAgreeOnRc(t, d, ctx, allNodes, []string{payer})
+	})
+
+	// RC-CEILING-OVERHANG-1 after the line. Last, because it leaves the account
+	// with no HBD and owing more than it can owe — the state the case before
+	// the line had to undo.
+	//
+	// The account needs the RC to pay for the transfer that gets it there (the
+	// whole point of RC-UNGATED-OPS-1 is that it does), so it is credited
+	// first; the transfer then takes the credit and everything else with it.
+	t.Run("after/10_an_account_owing_more_than_it_can_owe_still_recovers", func(t *testing.T) {
+		fundFreeTier(t)
+		avail, _ := rcNow(t)
+		if avail < rctCallMinRc {
+			t.Fatalf("%d RC available: the account needs the %d a transfer costs to get itself over its ceiling",
+				avail, rctCallMinRc)
+		}
+		status, moved, units := moveOut(t, "overhang after the line")
+		if status != "CONFIRMED" || !moved {
+			t.Fatalf("a transfer by an account with %d RC: status %s, money moved %v; it can pay, so it must run",
+				avail, status, moved)
+		}
+		if left, _ := rcNow(t); left != 0 {
+			t.Logf("note: %d RC still available after moving %d units out, so the overhang is smaller than "+
+				"planned; the measurement below is what matters", left, units)
+		}
+
+		gained, spanned, ceiling := overhang(t, "overhang after the line", rctOverhangBlocks)
+		want := ceiling * int64(spanned) / 144_000
+		if gained <= 0 {
+			t.Fatalf("the account regained %d RC over %d blocks while owing more than its %d ceiling; capped "+
+				"at that ceiling the return is about %d RC, and an account that moved its balance out must "+
+				"come back at the rate its ceiling allows instead of waiting out the whole stored total",
+				gained, spanned, ceiling, want)
+		}
+		if gained < want-2 || gained > want+2 {
+			t.Fatalf("the account regained %d RC over %d blocks, want about %d (its %d ceiling over the return "+
+				"period): the return must be computed from the ceiling it is capped at",
+				gained, spanned, want, ceiling)
+		}
+		t.Logf("owing more than its %d ceiling, the account still regained %d RC over %d blocks (below the "+
+			"line it would have regained nothing)", ceiling, gained, spanned)
 	})
 }

@@ -9,6 +9,10 @@
 #                     sell the same RC to call after call.
 #   RC-UNGATED-OPS-1  an operation other than a call is refused when its payer
 #                     cannot pay for it, instead of running unpriced.
+#   RC-CEILING-OVERHANG-1
+#                     an account owes at most what it can owe, so one that moved
+#                     its HBD out comes back at the rate its ceiling allows
+#                     instead of waiting out a total it can no longer owe.
 #
 # One test per line: the test name, then the env settings it runs with. Needs no
 # inputs — the probe contract is built from modules/wasm/e2e/go_wasm.
