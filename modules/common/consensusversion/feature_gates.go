@@ -1173,3 +1173,35 @@ func SlotAwareRcGateActive(active Version) bool {
 func OpsGatedOnRcActive(active Version) bool {
 	return Version0_18_0Active(active)
 }
+
+// FrozenRcCappedAtCeilingActive (0.18.0, RC-CEILING-OVERHANG-1) reports whether
+// an account's frozen RC is capped at what the account can owe before the
+// return is applied to it.
+//
+// Frozen RC is stored as one absolute amount at one height, while the most an
+// account can owe — its ceiling — is derived from its HBD balance plus the free
+// allowance. The stored amount is clamped against that ceiling only when it is
+// written, by a slot the account was charged in. An account that moves its HBD
+// out afterwards is left owing far more than its new ceiling, and because the
+// return is `stored amount * elapsed / RC_RETURN_PERIOD`, nothing at all
+// becomes available until that whole stored total has decayed back under the
+// ceiling: for an account that had spent a large balance's worth of RC, close
+// to the full five days. It cannot be re-clamped out of that state either,
+// because the clamp runs only for an account a slot charged, and a charge needs
+// RC it no longer has.
+//
+// From 0.18.0 the stored amount is capped at the ceiling and the return is
+// applied to the capped figure, so the account owes at most what it could owe
+// and its RC comes back in proportion: an account left holding only the free
+// allowance recovers at the free tier's rate instead of not at all.
+//
+// The cap is a view of the record, not a rewrite of it, so a balance that comes
+// back brings its RC obligation back with it on the same schedule it would have
+// had — there is nothing to gain by moving a balance out and back.
+//
+// Below the line the return is applied to the stored amount as it always was,
+// so settled history re-executes to the same budgets. Resolve `active` at the
+// height the RC is being read for.
+func FrozenRcCappedAtCeilingActive(active Version) bool {
+	return Version0_18_0Active(active)
+}

@@ -491,7 +491,16 @@ func (r *queryResolver) GetAccountRc(ctx context.Context, account string, height
 	//Get number of blocks that have elapsed since the last RC update
 	// review2 MEDIUM #107: overflow/negative/underflow-safe shared helper
 	// (was an inline int64(diff*uint64(amount)/period)).
-	frozenAmount := rc_system.CalculateFrozenBal(rcRecord.BlockHeight, highestHeight, rcRecord.Amount)
+	// RC-CEILING-OVERHANG-1 (0.18.0): the return is applied to the stored
+	// amount capped at what the account can owe, which is maxRcs here. A wallet
+	// decides nothing, but it has to show what the engine enforces — the lesson
+	// of RC-GQL-2 three lines up — so it reads the rule rather than assuming
+	// either side of it.
+	var capped bool
+	if r.StateEngine != nil {
+		capped = r.StateEngine.RcSystem.FrozenCapped(highestHeight)
+	}
+	frozenAmount := rc_system.EffectiveFrozenBal(rcRecord.BlockHeight, rcRecord.Amount, maxRcs, highestHeight, capped)
 	//Cap frozen to max available RCs
 	if frozenAmount > maxRcs {
 		frozenAmount = maxRcs

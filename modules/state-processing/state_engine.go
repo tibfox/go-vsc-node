@@ -3585,7 +3585,13 @@ func (se *StateEngine) UpdateRcMap(blockHeight uint64) {
 	// truncates to zero, that throws away every RC it would have regained.
 	// From 0.18.0 ChargeRc no longer records an uncharged payer, so this is
 	// also the belt on any other path that leaves a zero in the map.
-	skipUncharged := consensusversion.UnaffordableRcNotChargedActive(se.ActiveConsensusVersion(blockHeight))
+	active := se.ActiveConsensusVersion(blockHeight)
+	skipUncharged := consensusversion.UnaffordableRcNotChargedActive(active)
+	// RC-CEILING-OVERHANG-1 (0.18.0): the return is applied to the stored
+	// amount capped at the account's ceiling, the same view every reader of its
+	// RC now takes (rcSystem.EffectiveFrozenBal). Without it the write would
+	// carry forward a total the reads have already stopped charging it for.
+	capFrozen := consensusversion.FrozenRcCappedAtCeilingActive(active)
 	for k, v := range se.RcMap {
 		if skipUncharged && v == 0 {
 			continue
@@ -3594,25 +3600,29 @@ func (se *StateEngine) UpdateRcMap(blockHeight uint64) {
 		//Get the last rc record
 		rcRecord, _ := se.rcDb.GetRecord(k, blockHeight-1)
 
+		// The account's ceiling: its balance (+ free amount for Hive accounts).
+		// Read before the frozen total is carried forward, because from 0.18.0
+		// it is also what that total is capped at.
+		// VR2-17: read the network-resolved allowance, NOT the params global.
+		// This site is a per-slot consensus path (it clamps the persisted RC
+		// checkpoint), so a stale value here would silently disagree with the
+		// budget CanConsume computed in the same block.
+		balAmt := se.LedgerSystem.GetBalance(k, blockHeight, "hbd")
+		if strings.HasPrefix(k, "hive:") {
+			balAmt = balAmt + se.RcSystem.HiveFreeAmount
+		}
+
 		var rcBal int64
 		if rcRecord.BlockHeight == 0 {
 			rcBal = v
 		} else {
-			frozeAmt := rcSystem.CalculateFrozenBal(rcRecord.BlockHeight, blockHeight, rcRecord.Amount)
+			frozeAmt := rcSystem.EffectiveFrozenBal(rcRecord.BlockHeight, rcRecord.Amount, balAmt, blockHeight, capFrozen)
 
 			rcBal = frozeAmt + v
 		}
 
 		// Cap rcBal to the user's actual balance (+ free amount for Hive accounts)
 		// to prevent frozen RC from accumulating beyond what the user owns.
-		balAmt := se.LedgerSystem.GetBalance(k, blockHeight, "hbd")
-		if strings.HasPrefix(k, "hive:") {
-			// VR2-17: read the network-resolved allowance, NOT the params global.
-			// This site is a per-slot consensus path (it clamps the persisted RC
-			// checkpoint), so a stale value here would silently disagree with the
-			// budget CanConsume computed in the same block.
-			balAmt = balAmt + se.RcSystem.HiveFreeAmount
-		}
 		if rcBal > balAmt {
 			rcBal = balAmt
 		}
@@ -3962,6 +3972,16 @@ func New(sconf systemconfig.SystemConfig, da *DataLayer.DataLayer,
 	if identityConfig != nil {
 		se.selfHiveUsername = identityConfig.Get().HiveUsername
 	}
+
+	// RC-CEILING-OVERHANG-1 (0.18.0): the RC system decides whether an
+	// account's frozen total is capped at its ceiling before the return is
+	// applied to it, and that is a consensus rule, so it reads the version the
+	// same way every other rule does — through the engine's fail-stop election
+	// read. Wired here rather than passed to rcSystem.New because the resolver
+	// is a method on the engine being built. The transaction pool and the block
+	// producer are handed this same RcSystem (cmd/vsc-node/main.go), so they
+	// price an account exactly as the engine does.
+	se.RcSystem.ConsensusAt = se.ActiveConsensusVersion
 
 	se.pendulumGeometry = pendulumoracle.NewGeometryComputer(
 		&pendulumPoolReserveReader{
