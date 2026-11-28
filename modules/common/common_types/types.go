@@ -103,6 +103,14 @@ type StateEngine interface {
 	// BTC vault generation that still holds funds (POA-1, 0.9.0); read errors
 	// block and retry.
 	HeldShareOfFundedVaultOrBlock(account string, height uint64) bool
+	// RcChargedInSlot returns the RC the slot now executing has already charged
+	// `account`. It lives in the engine's in-memory RC map until the slot
+	// closes and UpdateRcMap folds it into the account's RC record, so it is
+	// invisible to an RcSession, which reads the committed record. A gate that
+	// prices a transaction has to subtract it or it hands every transaction of
+	// the slot the same budget (RC-SLOT-GATE-1, 0.18.0). Deterministic: the map
+	// is built from the slot's transactions in order.
+	RcChargedInSlot(account string) int64
 }
 
 type BlockStatusGetter interface {

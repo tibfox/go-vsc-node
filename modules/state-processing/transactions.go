@@ -109,6 +109,23 @@ func (t TxVscCallContract) ExecuteTx(
 
 	hasMinRCs, availableGas, _ := rcSession.CanConsume(rcPayer, t.Self.BlockHeight, 100)
 
+	// 0.18.0 (RC-SLOT-GATE-1): CanConsume reads the payer's committed RC record
+	// and the slot's ledger, but not what this slot has already charged it —
+	// that total only reaches the record when the slot closes. Without
+	// subtracting it, every call of a slot is handed the payer's full RC as its
+	// gas budget, and a payer can buy N times its RC in execution by splitting
+	// its calls across the ten blocks of one slot while the end-of-slot clamp
+	// takes its RC once. availableGas is what is left after the 100 RC
+	// minimum, so a negative result is exactly a payer that can no longer meet
+	// the minimum.
+	if consensusversion.SlotAwareRcGateActive(se.ActiveConsensusVersion(t.Self.BlockHeight)) {
+		availableGas -= se.RcChargedInSlot(rcPayer)
+		if availableGas < 0 {
+			availableGas = 0
+			hasMinRCs = false
+		}
+	}
+
 	if !hasMinRCs {
 		return errorToTxResult(fmt.Errorf("minimum RC requirement is not met. RCs available: %d", availableGas), 100)
 	}

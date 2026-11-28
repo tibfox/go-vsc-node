@@ -41,11 +41,11 @@ func TestVaultRotationV2ActiveOnlyAtOrAboveTheLine(t *testing.T) {
 		active Version
 		want   bool
 	}{
-		{Version{}, false},                                  // no election stored yet (fresh genesis)
-		{Version{Major: 0, Consensus: 3}, false},            // mainnet today
-		{Version{Major: 0, Consensus: 7}, false},            // POA shipped, vault-v2 not yet
-		{Version{Major: 0, Consensus: 8}, true},             // the line itself
-		{Version{Major: 0, Consensus: 9}, true},             // a later line still carries it
+		{Version{}, false},                       // no election stored yet (fresh genesis)
+		{Version{Major: 0, Consensus: 3}, false}, // mainnet today
+		{Version{Major: 0, Consensus: 7}, false}, // POA shipped, vault-v2 not yet
+		{Version{Major: 0, Consensus: 8}, true},  // the line itself
+		{Version{Major: 0, Consensus: 9}, true},  // a later line still carries it
 		// A major bump does NOT imply the batch: MeetsConsensusMin compares the
 		// components independently (Major >= min.Major AND Consensus >= min.Consensus),
 		// so 1.0.0 does not satisfy a 0.8.0 minimum. That is the semantic every gate in

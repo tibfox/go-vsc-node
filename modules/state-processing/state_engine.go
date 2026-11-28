@@ -2820,6 +2820,35 @@ func (se *StateEngine) ExecuteBatch() {
 				payer = vscTx.TxSelf().RequiredAuths[0]
 			}
 
+			// 0.18.0 (RC-UNGATED-OPS-1): an operation that is not a contract
+			// call charges a fixed RC when it is done and nothing asked first
+			// whether the payer had it. A call is gated (its 100 RC minimum, in
+			// TxVscCallContract.ExecuteTx, which also needs the figure for its
+			// gas budget); a transfer, withdraw, stake or unstake was not, so
+			// an account with no RC left kept making them — the charge landed
+			// on a frozen total the clamp had already pinned at the account's
+			// ceiling, where it changed nothing. RC is the only thing rationing
+			// these operations.
+			//
+			// Refused before it runs and charged nothing for the refusal: a
+			// charge for a refusal is RC-TREADMILL-1. Deposits never reach here
+			// (skipped above): a deposit is money arriving, and it is what
+			// gives an account RC to spend.
+			if vscTx.Type() != "call" &&
+				consensusversion.OpsGatedOnRcActive(se.ActiveConsensusVersion(vscTx.TxSelf().BlockHeight)) {
+				want := OpRcCost(vscTx.Type())
+				if !se.RcAffordable(rcSession, payer, vscTx.TxSelf().BlockHeight, want) {
+					left := se.RcRemainingInSlot(rcSession, payer, vscTx.TxSelf().BlockHeight)
+					log.Debug("TRANSACTION REVERTING - payer cannot pay the op's RC",
+						"payer", payer, "type", vscTx.Type(), "want", want, "left", left)
+					ok = false
+					ledgerSession.Revert()
+					se.recordTxFailure(tx.TxId, opFailure(idx, len(tx.Ops), vscTx.Type(),
+						fmt.Sprintf("not enough RCs available: %s costs %d RC, %d available", vscTx.Type(), want, left)))
+					break
+				}
+			}
+
 			var contractId string
 			lastContractMeta := contracts.ContractMetadata{}
 			lastStateCid := ""

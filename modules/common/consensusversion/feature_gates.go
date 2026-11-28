@@ -1126,3 +1126,50 @@ func Version0_18_0Active(active Version) bool {
 func UnaffordableRcNotChargedActive(active Version) bool {
 	return Version0_18_0Active(active)
 }
+
+// SlotAwareRcGateActive (0.18.0, RC-SLOT-GATE-1) reports whether the RC a slot
+// has already charged an account counts against what the next transaction of
+// that slot may spend.
+//
+// A transaction's RC is charged into the engine's in-memory RC map and only
+// folded into the payer's RC record when the slot closes, so the gate in front
+// of a contract call — rcSession.CanConsume, which reads the committed record
+// and the slot's ledger — cannot see it. Every transaction of a slot is
+// therefore handed the payer's full RC as its gas budget: an account with
+// 10,000 RC can buy ten times that in execution by splitting its calls across
+// the ten blocks of one slot. The clamp in UpdateRcMap takes the account's
+// whole RC at the end of it, once, however many budgets were handed out. From
+// 0.18.0, where an unaffordable charge is skipped entirely
+// (UnaffordableRcNotChargedActive), it would get the extra calls for nothing at
+// all, so the two rules belong on one line.
+//
+// Below the line the budget is computed from the committed record alone, so
+// settled history re-executes with the gas it was given. Resolve `active` at
+// the transaction's own block height.
+func SlotAwareRcGateActive(active Version) bool {
+	return Version0_18_0Active(active)
+}
+
+// OpsGatedOnRcActive (0.18.0, RC-UNGATED-OPS-1) reports whether an operation
+// other than a contract call is refused when its payer cannot pay for it.
+//
+// A contract call is gated: without the 100 RC minimum the engine refuses it
+// before running any code. A transfer, withdraw, stake or unstake is not. Each
+// one charges a fixed RC when it is done — 100 or 200 — and nothing asks first
+// whether the payer has it, so an account with no RC left keeps transferring:
+// the charge lands on a total the clamp has already pinned at the account's
+// ceiling, where it changes nothing. RC is the only thing rationing these
+// operations, and it was rationing nothing.
+//
+// From 0.18.0 an operation whose payer cannot cover its success-path cost fails
+// before it runs, and is charged nothing for the refusal (a charge for a
+// refusal is what RC-TREADMILL-1 is about). Deposits are never gated: a deposit
+// is money arriving, it is credited when the block is read, and it is the thing
+// that gives an account RC in the first place.
+//
+// Below the line the operation runs unpriced, as it always did, so settled
+// history re-executes to the same balances. Resolve `active` at the operation's
+// own block height.
+func OpsGatedOnRcActive(active Version) bool {
+	return Version0_18_0Active(active)
+}
