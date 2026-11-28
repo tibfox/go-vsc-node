@@ -1,8 +1,23 @@
 package devnet
 
-// RC-TREADMILL-1 on a real network: an account whose whole RC budget is the
-// Hive free allowance spends it, then keeps retrying — before and after the
-// floor reaches consensus 0.18.0.
+// The three 0.18.0 rules about RC an account does not have, on a real network,
+// before and after the floor reaches consensus 0.18.0. An account whose whole
+// RC budget is the Hive free allowance spends it, then:
+//
+//   - RC-TREADMILL-1: it keeps retrying. Every refused call is charged RC it
+//     does not have, which re-anchors its return and pins it at nothing.
+//   - RC-SLOT-GATE-1: it fires a burst of calls inside one slot. The RC a
+//     transaction is charged only reaches its RC record when the slot closes
+//     and the gate reads the record, so one slot sells every call of the burst
+//     the account's whole RC as its budget.
+//   - RC-UNGATED-OPS-1: it transfers. A transfer is charged a flat 100 RC when
+//     it is done, with nothing asking first whether the payer had it, so an
+//     account with no RC keeps transferring.
+//
+// The slot-gate and ungated-op cases credit the account a little HBD first (RC
+// is the HBD balance plus the free allowance, less what is frozen), which puts
+// its RC in a window where a burst of five calls is more than it can pay for
+// and gives it something to transfer.
 //
 // Below the line every retry is charged the flat 100 RC of a refused call
 // although the account has none, the clamp pins the stored total at the
@@ -27,7 +42,7 @@ package devnet
 // the live check on RC-GQL-2: an account with no balance record used to be
 // reported as holding its whole allowance however much of it was frozen.
 //
-//	DEVNET_FASTBLOCKS=1 DEVNET_BUDGET_CAP=150m \
+//	DEVNET_FASTBLOCKS=1 DEVNET_BUDGET_CAP=180m \
 //	  go test -v -run TestRcTreadmill_Activation -timeout 180m ./tests/devnet/
 //
 // The last case waits out the ~1,440 blocks the free allowance takes to return
@@ -61,6 +76,23 @@ const (
 	// rctReturnBlocksPerRc is how many blocks return one RC of the free
 	// allowance: RC_RETURN_PERIOD / RC_HIVE_FREE_AMOUNT = 144,000 / 10,000.
 	rctReturnBlocksPerRc = 15
+	// rctBurst is how many calls the slot-gate cases fire without waiting for
+	// any of them, so they land in one slot. More than the account can pay for
+	// (rctWindowUnits / rctCallMinRc), so the two rules differ in the count
+	// that runs.
+	rctBurst = 5
+	// rctWindowHbd / rctWindowUnits is the HBD credited to the free-tier
+	// account to put its available RC in a window where a handful of calls is
+	// more than it can pay for: 250 units of HBD are 250 RC, two and a half
+	// calls. Below the line one slot sells it all five; from 0.18.0 it sells
+	// exactly the two it can pay for.
+	rctWindowHbd   = "0.250"
+	rctWindowUnits = 250
+	// rctMoveHbd / rctMoveUnits is what the ungated-op cases transfer OUT of
+	// the free-tier account: small enough that the account can plainly afford
+	// it, so the only thing that can refuse the transfer is RC.
+	rctMoveHbd   = "0.050"
+	rctMoveUnits = 50
 )
 
 func TestRcTreadmill_Activation(t *testing.T) {
@@ -83,7 +115,7 @@ func TestRcTreadmill_Activation(t *testing.T) {
 			ConsensusVersionFloorConsensus: 17,
 		},
 	}
-	d, ctx := startDevnetNoKey(t, cfg, vfTestBudget(140*time.Minute))
+	d, ctx := startDevnetNoKey(t, cfg, vfTestBudget(170*time.Minute))
 
 	if err := d.WaitForBlockProcessing(ctx, 1, 30, 8*time.Minute); err != nil {
 		dumpDiagnostics(t, d, ctx)
@@ -217,6 +249,133 @@ func TestRcTreadmill_Activation(t *testing.T) {
 		}
 		t.Logf("%s: %d RC available, records %v", tag, left, records(t))
 	}
+	// burst fires n calls without waiting for any of them, so they are anchored
+	// within a block or two of each other and the engine executes them in one
+	// slot. Each payload differs: two identical operations in one Hive block
+	// would be the same transaction.
+	burst := func(t *testing.T, tag string, n int) (confirmed, failed int) {
+		t.Helper()
+		ids := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			txId, err := rcpCall(d, freeTier, cid, "noop", fmt.Sprintf("burst-%s-%d", tag, i), rctRetryLimit, nil)
+			if err != nil {
+				t.Fatalf("%s: broadcasting call %d: %v", tag, i+1, err)
+			}
+			ids = append(ids, txId)
+		}
+		for i, id := range ids {
+			switch status := rcpWaitFinal(d, ctx, rcpRefNode, id, 8*time.Minute); status {
+			case "CONFIRMED":
+				confirmed++
+			case "FAILED":
+				failed++
+			default:
+				t.Fatalf("%s: call %d never became final (tx %s)", tag, i+1, id)
+			}
+		}
+		return confirmed, failed
+	}
+	// fundFreeTier credits the free-tier account `units` of HBD from a witness,
+	// which is `units` more RC: RC is the account's HBD balance plus the free
+	// allowance, less what is frozen. It waits for the credit to reach what a
+	// wallet reads, which is the balance snapshot written when a slot is folded.
+	fundFreeTier := func(t *testing.T) {
+		t.Helper()
+		_, ceilingBefore := rcNow(t)
+		if _, err := d.ledgerOp("vsc.transfer", d.witnessAccount(3), freeTier, rctWindowHbd, "hbd", "rc window"); err != nil {
+			t.Fatalf("crediting %s with %s HBD: %v", payer, rctWindowHbd, err)
+		}
+		deadline := devnetNow().Add(8 * time.Minute)
+		for devnetNow().Before(deadline) {
+			if _, ceiling := rcNow(t); ceiling >= ceilingBefore+rctWindowUnits {
+				avail, _ := rcNow(t)
+				t.Logf("credited %s with %s HBD: %d RC available, ceiling %d (was %d)",
+					payer, rctWindowHbd, avail, ceiling, ceilingBefore)
+				return
+			}
+			devnetSleep(3 * time.Second)
+		}
+		_, ceiling := rcNow(t)
+		t.Fatalf("credited %s with %s HBD but its ceiling is %d, was %d", payer, rctWindowHbd, ceiling, ceilingBefore)
+	}
+	// restoreBalance credits the free-tier account the units moveOut moved out,
+	// so its ceiling matches the frozen total the slot stored for it and the
+	// cases that follow measure its return rather than an overhang.
+	restoreBalance := func(t *testing.T, tag string, ceilingAfterMove int64) {
+		t.Helper()
+		if _, err := d.ledgerOp("vsc.transfer", d.witnessAccount(3), freeTier, rctMoveHbd, "hbd", tag+" restore"); err != nil {
+			t.Fatalf("%s: putting the %d HBD units back: %v", tag, rctMoveUnits, err)
+		}
+		deadline := devnetNow().Add(8 * time.Minute)
+		for devnetNow().Before(deadline) {
+			if _, ceiling := rcNow(t); ceiling >= ceilingAfterMove+rctMoveUnits {
+				avail, _ := rcNow(t)
+				t.Logf("%s: put the %d HBD units back, ceiling %d, %d RC available", tag, rctMoveUnits, ceiling, avail)
+				return
+			}
+			devnetSleep(3 * time.Second)
+		}
+		_, ceiling := rcNow(t)
+		t.Fatalf("%s: put the %d HBD units back but the ceiling is %d, want %d — the account is left underwater "+
+			"and the cases after this one measure the overhang", tag, rctMoveUnits, ceiling, ceilingAfterMove+rctMoveUnits)
+	}
+
+	// moveOut transfers a little of the free-tier account's HBD back to a
+	// witness and returns the transaction's status and whether the money
+	// actually left. The balance is read as the RC ceiling, which is the
+	// account's HBD plus the free allowance: a transfer that ran lowers it.
+	//
+	// Money that moved is put back from the witness that received it, because a
+	// balance that falls leaves the account UNDERWATER: the slot's clamp caps
+	// the stored frozen total at the balance the account had when the slot
+	// closed (the balance index is folded a slot behind), so a debit in that
+	// same slot drops the ceiling below the stored total and the account's
+	// available RC is pinned at 0 until the decay works off the difference — 15
+	// blocks per RC, 720 blocks for the 50 units moved here. Without the
+	// restore the cases that follow measure that overhang instead of the
+	// return, which is exactly how this first showed up.
+	moveOut := func(t *testing.T, tag string) (status string, moved bool) {
+		t.Helper()
+		_, ceilingBefore := rcNow(t)
+		txId, err := d.ledgerOp("vsc.transfer", freeTier, d.witnessAccount(3), rctMoveHbd, "hbd", tag)
+		if err != nil {
+			t.Fatalf("%s: broadcasting the transfer: %v", tag, err)
+		}
+		status = rcpWaitFinal(d, ctx, rcpRefNode, txId, 8*time.Minute)
+		if status == "" {
+			t.Fatalf("%s: the transfer never became final (tx %s)", tag, txId)
+		}
+		// The balance snapshot is written when the slot is folded, so give it
+		// a couple of slots before concluding nothing moved.
+		deadline := devnetNow().Add(4 * time.Minute)
+		for devnetNow().Before(deadline) {
+			if _, ceiling := rcNow(t); ceiling <= ceilingBefore-rctMoveUnits {
+				restoreBalance(t, tag, ceiling)
+				return status, true
+			}
+			devnetSleep(3 * time.Second)
+		}
+		_, ceilingAfter := rcNow(t)
+		t.Logf("%s: transfer %s, ceiling %d -> %d", tag, status, ceilingBefore, ceilingAfter)
+		return status, false
+	}
+	// slotGate is the pair of measurements the slot-aware gate changes: how
+	// many calls of one burst ran, against how many the account could pay for.
+	slotGate := func(t *testing.T, tag string) (confirmed, affordable int, avail int64) {
+		t.Helper()
+		fundFreeTier(t)
+		avail, _ = rcNow(t)
+		affordable = int(avail / rctCallMinRc)
+		if affordable < 2 || affordable >= rctBurst {
+			t.Fatalf("%s: the account can pay for %d of the %d calls in the burst (%d RC available); the case "+
+				"needs a window where the burst asks for more than it can pay and less than nothing",
+				tag, affordable, rctBurst, avail)
+		}
+		confirmed, failed := burst(t, tag, rctBurst)
+		t.Logf("%s: %d RC available (%d calls' worth), %d of %d calls ran, %d were refused, records %v",
+			tag, avail, affordable, confirmed, rctBurst, failed, records(t))
+		return confirmed, affordable, avail
+	}
 	must := func(name string, f func(t *testing.T)) {
 		t.Helper()
 		if !t.Run(name, f) {
@@ -287,6 +446,39 @@ func TestRcTreadmill_Activation(t *testing.T) {
 		}
 		t.Logf("%d retries over %d blocks: %d records (was %d), newest %s, %d RC available of the %d an "+
 			"unbroken return would have given", rctRetries, spanned, len(after), len(base), after[len(after)-1], amount, unbroken)
+	})
+
+	// RC-SLOT-GATE-1, below the line: the RC a transaction is charged only
+	// reaches the account's RC record when the slot closes, and the gate in
+	// front of a call reads the record — so every call of a slot is handed the
+	// account's whole RC as its budget. One slot sells more execution than the
+	// account can pay for, and the end-of-slot clamp takes its RC once.
+	must("before/04b_one_slot_sells_more_calls_than_the_account_can_pay_for", func(t *testing.T) {
+		confirmed, affordable, avail := slotGate(t, "before the line")
+		if confirmed <= affordable {
+			t.Fatalf("%d of %d calls ran and the account could pay for %d (%d RC): below the line the gate "+
+				"reads the committed record, so a burst inside one slot should all have run. If only %d ran "+
+				"the burst did not share a slot — the calls have to be anchored within the same ten blocks",
+				confirmed, rctBurst, affordable, avail, confirmed)
+		}
+		t.Logf("one slot sold %d calls (%d RC of charges) to an account holding %d RC",
+			confirmed, int64(confirmed)*rctCallMinRc, avail)
+	})
+
+	// RC-UNGATED-OPS-1, below the line: a transfer is charged a flat 100 RC
+	// when it is done and nothing asked first whether the payer had it, so an
+	// account with no RC left keeps transferring.
+	must("before/04c_a_transfer_by_an_account_with_no_rc_still_runs", func(t *testing.T) {
+		if avail, _ := rcNow(t); avail >= rctCallMinRc {
+			drain(t, "before the ungated-op case")
+		}
+		avail, _ := rcNow(t)
+		status, moved := moveOut(t, "ungated transfer below the line")
+		if status != "CONFIRMED" || !moved {
+			t.Fatalf("a transfer by an account with %d RC: status %s, money moved %v; below the line it must "+
+				"still run — settled history depends on it", avail, status, moved)
+		}
+		t.Logf("with %d RC available the transfer ran anyway and moved %d HBD units", avail, rctMoveUnits)
 	})
 
 	// ------------------------------------------------------------------
@@ -377,6 +569,35 @@ func TestRcTreadmill_Activation(t *testing.T) {
 		}
 		t.Logf("%d retries over %d blocks: records unchanged (%v), available %d -> %d -> %d RC (an unbroken "+
 			"return over the span is about %d)", rctRetries, spanned, after, baseAmount, mid, amount, unbroken)
+	})
+
+	must("after/07c_one_slot_cannot_sell_more_calls_than_the_account_holds", func(t *testing.T) {
+		confirmed, affordable, avail := slotGate(t, "after the line")
+		if confirmed != affordable {
+			t.Fatalf("%d of %d calls ran and the account could only pay for %d (%d RC available): from 0.18.0 "+
+				"the gate counts what the slot has already charged, so exactly the calls it can pay for run "+
+				"and the rest are refused", confirmed, rctBurst, affordable, avail)
+		}
+		if left, _ := rcNow(t); left >= rctCallMinRc {
+			t.Fatalf("%d RC still available after the burst: the calls that ran must have been charged in full",
+				left)
+		}
+		t.Logf("one slot sold exactly the %d calls the account's %d RC covered, and refused the other %d",
+			confirmed, avail, rctBurst-confirmed)
+	})
+
+	must("after/07d_a_transfer_by_an_account_with_no_rc_is_refused", func(t *testing.T) {
+		avail, _ := rcNow(t)
+		if avail >= rctCallMinRc {
+			t.Fatalf("%d RC available: the previous case must leave the account unable to pay", avail)
+		}
+		status, moved := moveOut(t, "ungated transfer after the line")
+		if status != "FAILED" || moved {
+			t.Fatalf("a transfer by an account with %d RC: status %s, money moved %v; from 0.18.0 an operation "+
+				"whose payer cannot pay for it must not run — RC is the only thing rationing it",
+				avail, status, moved)
+		}
+		t.Logf("with %d RC available the transfer was refused and nothing moved", avail)
 	})
 
 	t.Run("after/08_the_free_tier_itself_is_charged_again_once_it_can_pay", func(t *testing.T) {
